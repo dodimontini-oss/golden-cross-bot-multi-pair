@@ -1,17 +1,22 @@
 """
-Live 50/200 SMA Golden Cross proximity check - NOT a new signal source, just
-a "how close is each currently-traded pair to a crossover right now" snapshot
-for discretionary awareness. Mirrors multi_pair_bot/bot.py's indicator math
-exactly (SMA, not EMA - the deployed strategy is a Simple Moving Average
-crossover) so the numbers here match what the live bot is actually watching.
+Live "what might trade soon" snapshot for the 9 deployed forex pairs - NOT a
+new signal source, mirrors multi_pair_bot/bot.py's actual live logic exactly
+(SMA 50/200, ATR, H4, plus the GAPCONFIRM entry filter deployed 2026-08-25)
+so this reports what the bot itself is watching.
 
-Checks the same H4 timeframe and 9-pair shortlist the live bot trades, using
-the most recent candles only (not a full-history backtest).
+Two states are checked, most-actionable first:
 
-"Closeness" is measured as the SMA50-SMA200 gap divided by ATR(14), since raw
-price gaps aren't comparable across pairs with different volatility/pip
-scales. A pair is flagged as "near crossover" if that ratio is below
-NEAR_THRESHOLD_ATR.
+1. CONFIRMING - a crossover already fired within the last CONFIRM_MAX_BARS
+   H4 candles and is still valid (no reversal since). These are the pairs
+   closest to an actual trade: bot.py will place the order as soon as the
+   fast/slow gap widens past CONFIRM_MIN_GAP_ATR (or already has, in which
+   case it should trade on its very next scheduled check). Reports current
+   gap progress toward that threshold.
+2. WATCHING - no recent crossover, but the fast/slow gap (relative to ATR)
+   is close enough to be worth keeping an eye on. This is a much earlier/
+   weaker signal than CONFIRMING - most WATCHING pairs never actually cross.
+
+Uses the most recent candles only (not a backtest).
 
 Environment variables required:
     OANDA_API_KEY
@@ -27,13 +32,19 @@ OANDA_BASE_URL = "https://api-fxpractice.oanda.com"
 HEADERS = {"Authorization": f"Bearer {OANDA_API_KEY}"}
 
 GRANULARITY = "H4"  # matches the live multi-pair bot's timeframe
-CANDLE_COUNT = 260   # SLOW_LEN(200) + ATR_LEN(14) + trend lookback + warm-up buffer
+CANDLE_COUNT = 260   # SLOW_LEN(200) + ATR_LEN(14) + confirm/trend lookback + warm-up buffer
 
 FAST_LEN = 50
 SLOW_LEN = 200
 ATR_LEN = 14
-NEAR_THRESHOLD_ATR = 0.25  # gap below this fraction of ATR(14) is flagged as "near crossover"
-LOOKBACK_FOR_TREND = 3     # candles used to say whether the gap is narrowing or widening
+
+# Must match multi_pair_bot/bot.py exactly - this reports against the bot's
+# actual live thresholds, not independently-chosen ones.
+CONFIRM_MIN_GAP_ATR = 0.10
+CONFIRM_MAX_BARS = 5
+
+NEAR_THRESHOLD_ATR = 0.25  # WATCHING-state threshold, independent of CONFIRM_MIN_GAP_ATR
+LOOKBACK_FOR_TREND = 3
 
 PAIRS = [
     "GBP_CHF", "GBP_CAD", "GBP_USD", "GBP_JPY", "GBP_AUD",
@@ -82,6 +93,17 @@ def atr_wilder(df: pd.DataFrame, length: int) -> pd.Series:
     return wilder_rma(tr, length)
 
 
+def find_crossovers(df: pd.DataFrame):
+    for i in range(1, len(df)):
+        prev, curr = df.iloc[i - 1], df.iloc[i]
+        if pd.isna(prev["slow_ma"]) or pd.isna(curr["slow_ma"]):
+            continue
+        if prev["fast_ma"] <= prev["slow_ma"] and curr["fast_ma"] > curr["slow_ma"]:
+            yield i, "LONG"
+        elif prev["fast_ma"] >= prev["slow_ma"] and curr["fast_ma"] < curr["slow_ma"]:
+            yield i, "SHORT"
+
+
 def check_pair(instrument: str):
     df = get_recent_candles(instrument, CANDLE_COUNT)
     if len(df) < SLOW_LEN + ATR_LEN + LOOKBACK_FOR_TREND:
@@ -93,26 +115,35 @@ def check_pair(instrument: str):
     df["gap"] = df["fast_ma"] - df["slow_ma"]
 
     latest = df.iloc[-1]
-    prior = df.iloc[-1 - LOOKBACK_FOR_TREND]
-
-    if pd.isna(latest["slow_ma"]) or pd.isna(prior["slow_ma"]):
+    if pd.isna(latest["slow_ma"]) or not latest["atr"]:
         return {"symbol": instrument, "error": "SMA200 not warmed up yet"}
 
-    gap_atr = abs(latest["gap"]) / latest["atr"] if latest["atr"] else float("inf")
-    gap_pips = abs(latest["gap"]) / pip_size(instrument)
+    gap_atr = abs(latest["gap"]) / latest["atr"]
+
+    # --- state 1: recent crossover, still valid, awaiting/already past gap confirmation ---
+    signals = list(find_crossovers(df))
+    if signals:
+        i, direction = signals[-1]
+        bars_since = (len(df) - 1) - i
+        if bars_since <= CONFIRM_MAX_BARS:
+            return {
+                "symbol": instrument, "state": "CONFIRMING", "direction": direction,
+                "bars_since": bars_since, "bars_left": CONFIRM_MAX_BARS - bars_since,
+                "gap_atr": gap_atr, "confirmed_now": gap_atr >= CONFIRM_MIN_GAP_ATR,
+                "close": latest["close"],
+            }
+
+    # --- state 2: no recent crossover - plain distance-to-crossover watch ---
+    prior = df.iloc[-1 - LOOKBACK_FOR_TREND]
+    if pd.isna(prior["slow_ma"]):
+        return {"symbol": instrument, "error": "not enough history for trend comparison"}
     narrowing = abs(latest["gap"]) < abs(prior["gap"])
     side = "fast>slow (bullish stance)" if latest["gap"] > 0 else "fast<slow (bearish stance)"
-
     return {
-        "symbol": instrument,
-        "close": latest["close"],
-        "fast_sma": latest["fast_ma"],
-        "slow_sma": latest["slow_ma"],
-        "gap_pips": gap_pips,
-        "gap_atr": gap_atr,
-        "side": side,
-        "narrowing": narrowing,
-        "near": gap_atr < NEAR_THRESHOLD_ATR,
+        "symbol": instrument, "state": "WATCHING", "close": latest["close"],
+        "fast_sma": latest["fast_ma"], "slow_sma": latest["slow_ma"],
+        "gap_pips": abs(latest["gap"]) / pip_size(instrument), "gap_atr": gap_atr,
+        "side": side, "narrowing": narrowing, "near": gap_atr < NEAR_THRESHOLD_ATR,
     }
 
 
@@ -124,18 +155,38 @@ def run():
         except Exception as e:
             results.append({"symbol": instrument, "error": str(e)})
 
-    ok = [r for r in results if "error" not in r]
+    confirming = [r for r in results if r.get("state") == "CONFIRMING"]
+    watching = [r for r in results if r.get("state") == "WATCHING"]
     errors = [r for r in results if "error" in r]
-    ok.sort(key=lambda r: r["gap_atr"])
 
-    print(f"\nSMA {FAST_LEN}/{SLOW_LEN} Golden Cross proximity check - {GRANULARITY} timeframe, {len(PAIRS)} pairs")
-    print(f"(gap/ATR below {NEAR_THRESHOLD_ATR} = flagged as near a possible crossover)\n")
-    print(f"{'Pair':<10} {'Close':>10} {'SMA50':>10} {'SMA200':>10} {'Gap(pips)':>10} {'Gap/ATR':>9}  {'Trend':<10} Side")
-    for r in ok:
-        flag = " <-- NEAR" if r["near"] else ""
-        trend = "narrowing" if r["narrowing"] else "widening"
-        print(f"{r['symbol']:<10} {r['close']:>10.5f} {r['fast_sma']:>10.5f} {r['slow_sma']:>10.5f} "
-              f"{r['gap_pips']:>10.1f} {r['gap_atr']:>9.3f}  {trend:<10} {r['side']}{flag}")
+    print(f"\nGolden Cross 'what might trade soon' check - {GRANULARITY}, {len(PAIRS)} pairs "
+          f"(matches multi_pair_bot/bot.py's live GAPCONFIRM logic exactly)\n")
+
+    if confirming:
+        confirming.sort(key=lambda r: (not r["confirmed_now"], -r["gap_atr"]))
+        print(f"CONFIRMING - crossed recently, closest to an actual trade:")
+        print(f"{'Pair':<10} {'Direction':<7} {'Close':>10} {'BarsSince':>10} {'BarsLeft':>9} "
+              f"{'Gap/ATR':>9} {'Status'}")
+        for r in confirming:
+            status = "READY - should trade next check" if r["confirmed_now"] else \
+                     f"waiting (need {CONFIRM_MIN_GAP_ATR}, have {r['gap_atr']:.3f})"
+            print(f"{r['symbol']:<10} {r['direction']:<7} {r['close']:>10.5f} {r['bars_since']:>10} "
+                  f"{r['bars_left']:>9} {r['gap_atr']:>9.3f} {status}")
+        print()
+    else:
+        print("CONFIRMING - none. No pair has crossed within the last "
+              f"{CONFIRM_MAX_BARS} bars.\n")
+
+    if watching:
+        watching.sort(key=lambda r: r["gap_atr"])
+        print(f"WATCHING - no recent crossover, ranked by distance (gap/ATR below {NEAR_THRESHOLD_ATR} flagged):")
+        print(f"{'Pair':<10} {'Close':>10} {'SMA50':>10} {'SMA200':>10} {'Gap(pips)':>10} {'Gap/ATR':>9}  {'Trend':<10} Side")
+        for r in watching:
+            flag = " <-- NEAR" if r["near"] else ""
+            trend = "narrowing" if r["narrowing"] else "widening"
+            print(f"{r['symbol']:<10} {r['close']:>10.5f} {r['fast_sma']:>10.5f} {r['slow_sma']:>10.5f} "
+                  f"{r['gap_pips']:>10.1f} {r['gap_atr']:>9.3f}  {trend:<10} {r['side']}{flag}")
+        print()
 
     for r in errors:
         print(f"{r['symbol']:<10} error - {r['error']}")
