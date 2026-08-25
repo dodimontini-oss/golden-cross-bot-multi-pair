@@ -8,6 +8,25 @@ H4 history (see forex_screener/screener.py) - each has profit factor > 1.15
 and controlled drawdown. Backtesting is not duplicated here; use the
 screener for that. This script is for live execution only.
 
+On top of the base 50/200 SMA Golden Cross, two filters validated in
+forex_screener/golden_cross_portfolio_lab.py (full 2015-2026 history, walk-
+forward checked on an early/late split - both beat baseline on profit
+factor, win rate, and net return in both halves) are applied:
+
+  - GAPCONFIRM: don't enter the instant a crossover fires - wait up to
+    CONFIRM_MAX_BARS H4 candles for the fast/slow MA gap to widen past
+    CONFIRM_MIN_GAP_ATR (relative to ATR), skipping narrow/marginal
+    crossovers that are more likely whipsaws. Recomputed fresh from OANDA
+    candle history every run rather than stored as bot-side state, since
+    GitHub Actions runs are stateless containers - this just looks back at
+    the last few candles each cycle instead of remembering "still waiting".
+  - CURCAP: blocks a new trade if it would push total open risk-dollars
+    sharing a currency (5 of the 9 pairs are GBP crosses) above
+    MAX_CURRENCY_RISK_PCT of equity. Each open trade's risk is reconstructed
+    from its live OANDA entry price and attached stop-loss price (same
+    "recompute from broker state, don't persist" pattern crypto_bot/
+    live_bot.py already uses for its own stop reconstruction).
+
 Modes:
     python bot.py once   - checks all pairs once, then exits (for scheduled
                             execution, e.g. GitHub Actions cron).
@@ -42,6 +61,12 @@ ATR_LEN = 14
 ATR_STOP_MULT = 2.0
 RR_RATIO = 2.0
 RISK_PER_TRADE_PCT = 1.0
+
+# Validated in forex_screener/golden_cross_portfolio_lab.py - same values used
+# there, don't change these without re-running that backtest.
+CONFIRM_MIN_GAP_ATR = 0.10
+CONFIRM_MAX_BARS = 5
+MAX_CURRENCY_RISK_PCT = 2.5
 
 # Validated shortlist from the 23-pair screen - profit factor > 1.15 and
 # controlled drawdown over the full 2015-2026 backtest.
@@ -95,6 +120,40 @@ def get_open_position_units(instrument: str) -> float:
     return float(pos["long"]["units"]) + float(pos["short"]["units"])
 
 
+def get_open_trades_risk_by_currency() -> dict:
+    """Risk-dollars currently committed per currency, across ALL open trades
+    on the account (not just one instrument) - reconstructed from each
+    trade's live entry price and attached stop-loss price rather than any
+    bot-stored value, so this stays correct even across GitHub Actions'
+    stateless runs. Returns {} (no cap enforced this cycle) if OANDA's
+    response doesn't have the shape we expect, rather than risking a schema
+    surprise silently blocking every future trade forever.
+    """
+    risk_by_ccy = {}
+    try:
+        url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        trades = resp.json()["trades"]
+    except Exception:
+        log.exception("Could not fetch open trades for currency-risk check - skipping CURCAP this cycle.")
+        return {}
+
+    for trade in trades:
+        try:
+            instrument = trade["instrument"]
+            entry_price = float(trade["price"])
+            units = abs(float(trade["currentUnits"]))
+            stop_price = float(trade["stopLossOrder"]["price"])
+            risk_dollars = units * abs(entry_price - stop_price)
+            for ccy in currency_legs(instrument):
+                risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + risk_dollars
+        except (KeyError, ValueError, TypeError):
+            log.warning("Open trade %s missing expected fields for risk calc - "
+                        "not counted toward the currency cap this cycle.", trade.get("instrument", "?"))
+    return risk_by_ccy
+
+
 def place_order(instrument: str, units: int, stop: float, target: float) -> dict:
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     body = {
@@ -111,6 +170,11 @@ def place_order(instrument: str, units: int, stop: float, target: float) -> dict
     resp = requests.post(url, headers=HEADERS, json=body, timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+def currency_legs(pair: str) -> tuple:
+    base, quote = pair.split("_")
+    return base, quote
 
 
 # ---------------- Indicators - matches Pine's ta.sma()/ta.atr() exactly ----------------
@@ -158,51 +222,95 @@ def find_crossovers(df: pd.DataFrame):
             yield i, "SHORT"
 
 
-# ---------------- Core check-and-trade, per instrument ----------------
+def find_confirmed_signal(df: pd.DataFrame):
+    """Most recent crossover, gap-confirmed, within CONFIRM_MAX_BARS of
+    forming. Mirrors golden_cross_portfolio_lab.py's GAPCONFIRM logic, just
+    recomputed from the recent candle window each call instead of carried as
+    state between runs - if a reversal happened after the crossover, that
+    reversal is itself the most recent crossover (find_crossovers naturally
+    picks it up as signals[-1]), so no separate "still valid" check is needed.
 
-def check_and_trade(instrument: str, df: pd.DataFrame):
-    df = add_indicators(df)
+    Returns (i, direction, bars_since) or None.
+    """
     signals = list(find_crossovers(df))
     if not signals:
-        log.info("[%s] No fresh crossover. No action.", instrument)
-        return
-
+        return None
     i, direction = signals[-1]
-    if i != len(df) - 1:
-        log.info("[%s] Most recent signal isn't on the latest candle - stale. No action.", instrument)
+    bars_since = (len(df) - 1) - i
+    if bars_since > CONFIRM_MAX_BARS:
+        return None  # crossover is real but timed out waiting for confirmation
+
+    row = df.iloc[-1]
+    if pd.isna(row["atr"]) or row["atr"] <= 0:
+        return None
+    gap_atr = abs(row["fast_ma"] - row["slow_ma"]) / row["atr"]
+    if gap_atr < CONFIRM_MIN_GAP_ATR:
+        return None  # crossover is real but hasn't widened enough yet
+
+    return i, direction, bars_since
+
+
+# ---------------- Core check-and-trade, per instrument ----------------
+
+def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, risk_by_ccy: dict):
+    df = add_indicators(df)
+    signal = find_confirmed_signal(df)
+    if signal is None:
+        log.info("[%s] No gap-confirmed crossover. No action.", instrument)
         return
 
-    row = df.iloc[i]
+    i, direction, bars_since = signal
+    row = df.iloc[i]  # signal candle - use ITS atr for stop sizing, not the latest bar's
+
     position = get_open_position_units(instrument)
     if position != 0:
         log.info("[%s] Already in a position (%s units). No action.", instrument, position)
         return
 
-    balance = get_account_balance()
+    base, quote = currency_legs(instrument)
     risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
+    cap_dollars = balance * (MAX_CURRENCY_RISK_PCT / 100)
+    base_risk = risk_by_ccy.get(base, 0.0)
+    quote_risk = risk_by_ccy.get(quote, 0.0)
+    if base_risk + risk_amount > cap_dollars or quote_risk + risk_amount > cap_dollars:
+        log.info("[%s] %s signal confirmed (%d bars ago) but blocked by currency exposure cap "
+                  "(%s open risk=%.2f, %s open risk=%.2f, cap=%.2f). No action.",
+                  instrument, direction, bars_since, base, base_risk, quote, quote_risk, cap_dollars)
+        return
+
+    latest_close = df.iloc[-1]["close"]
     stop_distance = row["atr"] * ATR_STOP_MULT
     units = int(risk_amount / stop_distance)
 
     if direction == "LONG":
-        stop, target = row["close"] - stop_distance, row["close"] + stop_distance * RR_RATIO
+        stop, target = latest_close - stop_distance, latest_close + stop_distance * RR_RATIO
     else:
-        stop, target = row["close"] + stop_distance, row["close"] - stop_distance * RR_RATIO
+        stop, target = latest_close + stop_distance, latest_close - stop_distance * RR_RATIO
         units = -units
 
-    log.info("[%s] %s signal at %s (close=%.5f) - placing order: units=%d stop=%.5f target=%.5f",
-              instrument, direction, row["time"], row["close"], units, stop, target)
+    log.info("[%s] %s signal confirmed (%d bars ago, gap-confirmed) at close=%.5f - "
+              "placing order: units=%d stop=%.5f target=%.5f",
+              instrument, direction, bars_since, latest_close, units, stop, target)
     result = place_order(instrument, units, stop, target)
     log.info("[%s] OANDA response: %s", instrument, result)
 
+    # update in-memory so a second pair sharing this currency, checked later
+    # in the same cycle, sees this trade's risk too - not just what OANDA
+    # already knew about at the start of this run.
+    for ccy in (base, quote):
+        risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + risk_amount
+
 
 def check_all_pairs():
+    balance = get_account_balance()
+    risk_by_ccy = get_open_trades_risk_by_currency()
     for instrument in PAIRS:
         try:
             df = get_recent_candles(instrument, count=SLOW_LEN + ATR_LEN + 10)
             if len(df) < SLOW_LEN + 2:
                 log.warning("[%s] Not enough candle history yet (%d bars).", instrument, len(df))
                 continue
-            check_and_trade(instrument, df)
+            check_and_trade(instrument, df, balance, risk_by_ccy)
         except Exception:
             log.exception("[%s] Error during check - skipping this pair this cycle.", instrument)
 
