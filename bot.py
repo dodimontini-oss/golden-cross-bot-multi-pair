@@ -102,11 +102,37 @@ def _candles_to_df(candles: list) -> pd.DataFrame:
     return df[df["complete"]].reset_index(drop=True)
 
 
-def get_account_balance() -> float:
+def get_account_info() -> tuple:
+    """Returns (balance, currency) - the account's own currency is needed to
+    correctly convert quote-currency price distances into account-currency
+    risk amounts (see get_conversion_rate)."""
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
     resp = requests.get(url, headers=HEADERS, timeout=10)
     resp.raise_for_status()
-    return float(resp.json()["account"]["balance"])
+    account = resp.json()["account"]
+    return float(account["balance"]), account["currency"]
+
+
+def get_conversion_rate(from_currency: str, to_currency: str) -> float:
+    """How many units of to_currency 1 unit of from_currency is worth, using
+    the latest OANDA price. ATR/stop/target are computed in the QUOTE
+    currency of the traded pair (e.g. JPY for GBP_JPY), but risk sizing and
+    the currency cap both need amounts in the ACCOUNT's currency - for any
+    pair whose quote currency isn't the account currency (7 of the 9 live
+    pairs; only GBP_USD/EUR_USD already quote in USD), skipping this
+    conversion silently mis-sizes the position by the exchange rate.
+    Confirmed live 2026-08-26: GBP_JPY was undersized ~160x (JPY/USD rate),
+    risking ~$0.61 instead of the intended ~1% of equity."""
+    if from_currency == to_currency:
+        return 1.0
+    try:
+        df = get_recent_candles(f"{from_currency}_{to_currency}", count=2)
+        if not df.empty:
+            return df.iloc[-1]["close"]
+    except Exception:
+        pass
+    df = get_recent_candles(f"{to_currency}_{from_currency}", count=2)
+    return 1.0 / df.iloc[-1]["close"]
 
 
 def get_open_position_units(instrument: str) -> float:
@@ -120,14 +146,14 @@ def get_open_position_units(instrument: str) -> float:
     return float(pos["long"]["units"]) + float(pos["short"]["units"])
 
 
-def get_open_trades_risk_by_currency() -> dict:
-    """Risk-dollars currently committed per currency, across ALL open trades
-    on the account (not just one instrument) - reconstructed from each
-    trade's live entry price and attached stop-loss price rather than any
-    bot-stored value, so this stays correct even across GitHub Actions'
-    stateless runs. Returns {} (no cap enforced this cycle) if OANDA's
-    response doesn't have the shape we expect, rather than risking a schema
-    surprise silently blocking every future trade forever.
+def get_open_trades_risk_by_currency(account_ccy: str) -> dict:
+    """Risk, in account-currency terms, currently committed per currency,
+    across ALL open trades on the account (not just one instrument) -
+    reconstructed from each trade's live entry price and attached stop-loss
+    price rather than any bot-stored value, so this stays correct even
+    across GitHub Actions' stateless runs. Returns {} (no cap enforced this
+    cycle) if OANDA's response doesn't have the shape we expect, rather than
+    risking a schema surprise silently blocking every future trade forever.
     """
     risk_by_ccy = {}
     try:
@@ -145,9 +171,11 @@ def get_open_trades_risk_by_currency() -> dict:
             entry_price = float(trade["price"])
             units = abs(float(trade["currentUnits"]))
             stop_price = float(trade["stopLossOrder"]["price"])
-            risk_dollars = units * abs(entry_price - stop_price)
+            _, quote = currency_legs(instrument)
+            quote_to_account = get_conversion_rate(quote, account_ccy)
+            risk_amount = units * abs(entry_price - stop_price) * quote_to_account
             for ccy in currency_legs(instrument):
-                risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + risk_dollars
+                risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + risk_amount
         except (KeyError, ValueError, TypeError):
             log.warning("Open trade %s missing expected fields for risk calc - "
                         "not counted toward the currency cap this cycle.", trade.get("instrument", "?"))
@@ -259,7 +287,7 @@ def find_confirmed_signal(df: pd.DataFrame):
 
 # ---------------- Core check-and-trade, per instrument ----------------
 
-def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, risk_by_ccy: dict):
+def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, account_ccy: str, risk_by_ccy: dict):
     df = add_indicators(df)
     signal = find_confirmed_signal(df)
     if signal is None:
@@ -287,7 +315,8 @@ def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, risk_by_c
 
     latest_close = df.iloc[-1]["close"]
     stop_distance = row["atr"] * ATR_STOP_MULT
-    units = int(risk_amount / stop_distance)
+    quote_to_account = get_conversion_rate(quote, account_ccy)
+    units = int(risk_amount / (stop_distance * quote_to_account))
 
     if direction == "LONG":
         stop, target = latest_close - stop_distance, latest_close + stop_distance * RR_RATIO
@@ -309,15 +338,15 @@ def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, risk_by_c
 
 
 def check_all_pairs():
-    balance = get_account_balance()
-    risk_by_ccy = get_open_trades_risk_by_currency()
+    balance, account_ccy = get_account_info()
+    risk_by_ccy = get_open_trades_risk_by_currency(account_ccy)
     for instrument in PAIRS:
         try:
             df = get_recent_candles(instrument, count=SLOW_LEN + ATR_LEN + 10)
             if len(df) < SLOW_LEN + 2:
                 log.warning("[%s] Not enough candle history yet (%d bars).", instrument, len(df))
                 continue
-            check_and_trade(instrument, df, balance, risk_by_ccy)
+            check_and_trade(instrument, df, balance, account_ccy, risk_by_ccy)
         except Exception:
             log.exception("[%s] Error during check - skipping this pair this cycle.", instrument)
 
@@ -345,8 +374,8 @@ def run_test():
     to confirm the OANDA connection works end-to-end."""
     instrument = PAIRS[0]
     log.info("Connectivity test - placing one small order on %s.", instrument)
-    balance = get_account_balance()
-    log.info("Balance fetched OK: %.2f", balance)
+    balance, account_ccy = get_account_info()
+    log.info("Balance fetched OK: %.2f %s", balance, account_ccy)
     candles = get_recent_candles(instrument, count=5)
     last_close = candles.iloc[-1]["close"]
     stop, target = last_close - 0.0050, last_close + 0.0050
