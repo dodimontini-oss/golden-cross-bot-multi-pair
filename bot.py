@@ -39,6 +39,11 @@ Environment variables required:
     OANDA_ACCOUNT_ID  - your practice account ID
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from trading_core import execution as safety
+
 import logging
 import os
 import sys
@@ -110,7 +115,7 @@ def get_account_info() -> tuple:
     resp = requests.get(url, headers=HEADERS, timeout=10)
     resp.raise_for_status()
     account = resp.json()["account"]
-    return float(account["balance"]), account["currency"]
+    return float(account["NAV"]), account["currency"]
 
 
 def get_conversion_rate(from_currency: str, to_currency: str) -> float:
@@ -162,8 +167,8 @@ def get_open_trades_risk_by_currency(account_ccy: str) -> dict:
         resp.raise_for_status()
         trades = resp.json()["trades"]
     except Exception:
-        log.exception("Could not fetch open trades for currency-risk check - skipping CURCAP this cycle.")
-        return {}
+        log.exception("Could not fetch open trades for currency-risk check - blocking new entries.")
+        raise RuntimeError("Currency exposure unknown; new entries disabled")
 
     for trade in trades:
         try:
@@ -177,8 +182,7 @@ def get_open_trades_risk_by_currency(account_ccy: str) -> dict:
             for ccy in currency_legs(instrument):
                 risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + risk_amount
         except (KeyError, ValueError, TypeError):
-            log.warning("Open trade %s missing expected fields for risk calc - "
-                        "not counted toward the currency cap this cycle.", trade.get("instrument", "?"))
+            raise RuntimeError("Open trade lacks reliable risk fields; new entries disabled")
     return risk_by_ccy
 
 
@@ -188,7 +192,7 @@ def price_decimals(instrument: str) -> int:
     return 3 if "JPY" in instrument else 5
 
 
-def place_order(instrument: str, units: int, stop: float, target: float) -> dict:
+def place_order(instrument: str, units: int, stop: float, target: float, client_id=None) -> dict:
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     decimals = price_decimals(instrument)
     body = {
@@ -202,9 +206,27 @@ def place_order(instrument: str, units: int, stop: float, target: float) -> dict
             "takeProfitOnFill": {"price": f"{target:.{decimals}f}"},
         }
     }
-    resp = requests.post(url, headers=HEADERS, json=body, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    if units == 0:
+        raise ValueError("Cannot place zero units")
+    if client_id:
+        check = requests.get(url+"/@"+client_id, headers=HEADERS, timeout=15)
+        if check.status_code != 404:
+            check.raise_for_status()
+            return check.json()
+        body["order"]["clientExtensions"] = {"id":client_id,"tag":"golden-cross"}
+    try:
+        resp = requests.post(url, headers=HEADERS, json=body, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException:
+        if client_id:
+            # The request may have timed out after OANDA accepted it. Query
+            # the durable client ID before deciding that the mutation failed.
+            check = requests.get(url + "/@" + client_id, headers=HEADERS, timeout=15)
+            if check.status_code != 404:
+                check.raise_for_status()
+                return check.json()
+        raise
 
 
 def currency_legs(pair: str) -> tuple:
@@ -313,7 +335,21 @@ def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, account_c
                   instrument, direction, bars_since, base, base_risk, quote, quote_risk, cap_dollars)
         return
 
-    latest_close = df.iloc[-1]["close"]
+    signal_time = df.iloc[i]["time"]
+    client_id = safety.signal_id("fxgc",instrument,signal_time)
+    # Protect migrations too: an untagged trade opened since the signal consumes it.
+    history = requests.get(f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades",
+        headers=HEADERS,params={"instrument":instrument,"state":"ALL","count":500},timeout=15)
+    history.raise_for_status()
+    if any(pd.Timestamp(t["openTime"]) >= pd.Timestamp(signal_time) for t in history.json()["trades"]):
+        return
+    quote_response = requests.get(f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing",
+        headers=HEADERS,params={"instruments":instrument},timeout=15)
+    quote_response.raise_for_status()
+    price = quote_response.json()["prices"][0]
+    if not price.get("tradeable",False) or pd.Timestamp.now(tz="UTC")-pd.Timestamp(price["time"]) > pd.Timedelta(minutes=1):
+        raise RuntimeError("Non-tradeable or stale forex quote")
+    latest_close = safety.positive(price["asks" if direction=="LONG" else "bids"][0]["price"])
     stop_distance = row["atr"] * ATR_STOP_MULT
     quote_to_account = get_conversion_rate(quote, account_ccy)
     units = int(risk_amount / (stop_distance * quote_to_account))
@@ -327,8 +363,11 @@ def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, account_c
     log.info("[%s] %s signal confirmed (%d bars ago, gap-confirmed) at close=%.5f - "
               "placing order: units=%d stop=%.5f target=%.5f",
               instrument, direction, bars_since, latest_close, units, stop, target)
-    result = place_order(instrument, units, stop, target)
+    result = place_order(instrument, units, stop, target, client_id)
     log.info("[%s] OANDA response: %s", instrument, result)
+
+    if "orderFillTransaction" not in result:
+        raise RuntimeError("Order did not confirm a fill; reconcile before continuing")
 
     # update in-memory so a second pair sharing this currency, checked later
     # in the same cycle, sees this trade's risk too - not just what OANDA
@@ -338,6 +377,7 @@ def check_and_trade(instrument: str, df: pd.DataFrame, balance: float, account_c
 
 
 def check_all_pairs():
+    errors = []
     balance, account_ccy = get_account_info()
     risk_by_ccy = get_open_trades_risk_by_currency(account_ccy)
     for instrument in PAIRS:
@@ -348,7 +388,10 @@ def check_all_pairs():
                 continue
             check_and_trade(instrument, df, balance, account_ccy, risk_by_ccy)
         except Exception:
+            errors.append(instrument)
             log.exception("[%s] Error during check - skipping this pair this cycle.", instrument)
+    if errors:
+        raise RuntimeError(f"Incomplete forex cycle: {errors}")
 
 
 # ---------------- Modes ----------------

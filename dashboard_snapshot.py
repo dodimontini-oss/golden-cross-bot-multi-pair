@@ -36,10 +36,21 @@ def get_account_summary() -> dict:
 
 
 def get_all_trades() -> list:
-    resp = requests.get(f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades",
-                         headers=HEADERS, params={"state": "ALL", "count": 500}, timeout=15)
-    resp.raise_for_status()
-    return resp.json()["trades"]
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades"
+    params = {"state": "ALL", "count": 500}
+    trades, seen = [], set()
+    while True:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+        page = resp.json()["trades"]
+        fresh = [trade for trade in page if trade["id"] not in seen]
+        trades.extend(fresh)
+        seen.update(trade["id"] for trade in fresh)
+        if len(page) < 500:
+            return trades
+        if not fresh:
+            raise RuntimeError("OANDA trade-history pagination did not advance")
+        params["beforeID"] = str(min(int(trade["id"]) for trade in page))
 
 
 def direction(trade: dict) -> str:
@@ -54,7 +65,10 @@ def run():
     realized_pl_alltime = float(account.get("pl", 0.0))
     currency = account.get("currency", "USD")
 
-    trades = get_all_trades()
+    trades = [
+        trade for trade in get_all_trades()
+        if trade.get("clientExtensions", {}).get("tag") != "tradingview-bridge"
+    ]
     open_trades = [t for t in trades if t["state"] == "OPEN"]
     closed_trades = sorted((t for t in trades if t["state"] == "CLOSED"), key=lambda t: t.get("closeTime", ""))
 
