@@ -430,10 +430,14 @@ def run_test():
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "live"
-    if mode == "once":
-        run_once()
-    elif mode == "test":
-        run_test()
+    if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        from paper_smoke_test import oanda_cancel_test
+        oanda_cancel_test(OANDA_BASE_URL, OANDA_ACCOUNT_ID, HEADERS, PAIRS[0])
     else:
-        run_live()
+        mode = sys.argv[1] if len(sys.argv) > 1 else "live"
+        if mode == "once":
+            run_once()
+        elif mode == "test":
+            run_test()
+        else:
+            run_live()
