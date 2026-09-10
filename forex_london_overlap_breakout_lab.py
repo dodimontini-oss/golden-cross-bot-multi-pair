@@ -59,7 +59,20 @@ population the 82-83% directional accuracy was actually measured on.
 Added a THIRD candidate type, "relvol_and_range" (require both signals on
 the SAME window simultaneously) to test whether that confluence narrows
 the trigger down closer to the real big-move-day population, the same way
-ORB's RELVOL+GAP confluence beat RELVOL alone on QQQ.
+ORB's RELVOL+GAP confluence beat RELVOL alone on QQQ. UPDATE: that also
+came back flat-to-worse (PF unchanged or slightly down, trade count
+roughly halved) - RELVOL and RANGE on one H4 bar turn out to be far more
+correlated with each other than QQQ's GAP and RELVOL were, so requiring
+both barely narrows the population.
+
+UPDATE 2026-09-10 (again): added CROSS-WINDOW confluence via
+`simulate_pair_cross()` - require LONDON AND OVERLAP to BOTH fire the
+same signal type AND agree on direction, entering once OVERLAP (the
+later bar) has closed. This is a genuinely different idea from
+relvol_and_range: LONDON and OVERLAP are different bars four hours apart
+(not one bar's two correlated stats), so this cross-window agreement
+could plausibly narrow down to a cleaner subset even though the
+same-window confluence didn't.
 
 Run (needs OANDA_API_KEY):
     python forex_london_overlap_breakout_lab.py
@@ -185,6 +198,37 @@ class Trade:
         self.direction, self.entry_time, self.exit_time, self.r_multiple = direction, entry_time, exit_time, r_multiple
 
 
+def _resolve_trade(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: int):
+    """Shared exit-scanning logic: enter at h4.iloc[entry_idx]'s open, ATR
+    taken from the just-closed prior bar, scan forward from the entry bar
+    itself (same-day-resolution fix) for the first stop/target hit.
+    Returns (r_outcome, entry_price, exit_idx) or None if untradeable
+    (ATR not yet warmed up)."""
+    entry_bar = h4.iloc[entry_idx]
+    entry_price = entry_bar["open"]
+    a = atr.iloc[entry_idx - 1] if entry_idx > 0 else float("nan")
+    if pd.isna(a) or a <= 0:
+        return None
+    stop_dist = ATR_STOP_MULT * a
+    if direction == 1:
+        stop_price, target_price = entry_price - stop_dist, entry_price + RR_RATIO * stop_dist
+    else:
+        stop_price, target_price = entry_price + stop_dist, entry_price - RR_RATIO * stop_dist
+
+    for j in range(entry_idx, len(h4)):
+        bar = h4.iloc[j]
+        hit_stop = bar["low"] <= stop_price if direction == 1 else bar["high"] >= stop_price
+        hit_target = bar["high"] >= target_price if direction == 1 else bar["low"] <= target_price
+        if hit_stop:  # dual-hit -> conservative: stop wins
+            return -1.0, entry_price, j
+        if hit_target:
+            return RR_RATIO, entry_price, j
+
+    last = h4.iloc[-1]
+    move = (last["close"] - entry_price) if direction == 1 else (entry_price - last["close"])
+    return move / stop_dist, entry_price, len(h4) - 1
+
+
 def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str):
     flag_col = f"{label}_{candidate}"
     dir_col = f"{label}_dir"
@@ -205,37 +249,56 @@ def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, 
         entry_idx = int(day[entry_idx_col])
         if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
             continue
-        entry_bar = h4.iloc[entry_idx]
-        entry_price = entry_bar["open"]
-        a = atr.iloc[entry_idx - 1] if entry_idx > 0 else float("nan")
-        if pd.isna(a) or a <= 0:
+        result = _resolve_trade(h4, atr, entry_idx, direction)
+        if result is None:
             continue
-        stop_dist = ATR_STOP_MULT * a
-        if direction == 1:
-            stop_price, target_price = entry_price - stop_dist, entry_price + RR_RATIO * stop_dist
-        else:
-            stop_price, target_price = entry_price + stop_dist, entry_price - RR_RATIO * stop_dist
-
-        r_outcome, exit_idx = None, None
-        for j in range(entry_idx, len(h4)):
-            bar = h4.iloc[j]
-            hit_stop = bar["low"] <= stop_price if direction == 1 else bar["high"] >= stop_price
-            hit_target = bar["high"] >= target_price if direction == 1 else bar["low"] <= target_price
-            if hit_stop:  # dual-hit -> conservative: stop wins
-                r_outcome, exit_idx = -1.0, j
-                break
-            if hit_target:
-                r_outcome, exit_idx = RR_RATIO, j
-                break
-        if r_outcome is None:
-            last = h4.iloc[-1]
-            move = (last["close"] - entry_price) if direction == 1 else (entry_price - last["close"])
-            r_outcome, exit_idx = move / stop_dist, len(h4) - 1
+        r_outcome, entry_price, exit_idx = result
 
         equity *= (1 + RISK_PCT * r_outcome)
         equity_curve.append(equity)
         blocked_until_idx = exit_idx
-        trades.append(Trade(pair, label, candidate, direction, entry_bar["time"], h4.iloc[exit_idx]["time"], r_outcome))
+        trades.append(Trade(pair, label, candidate, direction, h4.iloc[entry_idx]["time"], h4.iloc[exit_idx]["time"], r_outcome))
+
+    return trades, equity_curve
+
+
+def simulate_pair_cross(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, candidate: str):
+    """Cross-window confluence: require LONDON AND OVERLAP to BOTH show the
+    signal on the SAME day AND agree on direction, entering only once
+    OVERLAP has closed (the later of the two signal bars). A genuinely
+    different idea from relvol_and_range (which combined two signals on
+    ONE window and didn't help, because RELVOL and RANGE on a single bar
+    are highly correlated by construction) - LONDON and OVERLAP are
+    different bars four hours apart, shown to fire on partly independent
+    subsets of days in forex_opening_range_lab.py's original screen."""
+    flag_a, flag_b = f"LONDON_{candidate}", f"OVERLAP_{candidate}"
+    entry_idx_col = "OVERLAP_entry_bar_idx"
+    atr = atr_wilder(h4, ATR_LEN)
+
+    trades = []
+    equity_curve = [STARTING_EQUITY]
+    equity = STARTING_EQUITY
+    blocked_until_idx = -1
+
+    for _, day in daily.iterrows():
+        if not (bool(day.get(flag_a, False)) and bool(day.get(flag_b, False))):
+            continue
+        london_dir, overlap_dir = day["LONDON_dir"], day["OVERLAP_dir"]
+        if london_dir == 0 or london_dir != overlap_dir:
+            continue
+        direction = overlap_dir
+        entry_idx = int(day[entry_idx_col])
+        if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
+            continue
+        result = _resolve_trade(h4, atr, entry_idx, direction)
+        if result is None:
+            continue
+        r_outcome, entry_price, exit_idx = result
+
+        equity *= (1 + RISK_PCT * r_outcome)
+        equity_curve.append(equity)
+        blocked_until_idx = exit_idx
+        trades.append(Trade(pair, "CROSS", candidate, direction, h4.iloc[entry_idx]["time"], h4.iloc[exit_idx]["time"], r_outcome))
 
     return trades, equity_curve
 
@@ -292,6 +355,21 @@ def main():
             name = f"{label}_{candidate.upper()}"
             all_results[name] = (pooled_trades, stats, worst_dd)
             print(f"{name:<24} {stats['trades']:>7} {stats['win_rate']:>6.1f}% {stats['pf']:>8.3f} {worst_dd:>12.2f}%")
+
+    # CROSS-WINDOW confluence: LONDON and OVERLAP both fire AND agree on direction.
+    for candidate in ("relvol", "range_top20"):
+        pooled_trades = []
+        dds = []
+        for pair in PAIRS:
+            trades, curve = simulate_pair_cross(pair, per_pair_h4[pair], per_pair_daily[pair], candidate)
+            pooled_trades.extend(trades)
+            if len(curve) > 1:
+                dds.append(max_dd_pct(curve))
+        stats = pf_stats(pooled_trades)
+        worst_dd = max(dds) if dds else float("nan")
+        name = f"CROSS_{candidate.upper()}"
+        all_results[name] = (pooled_trades, stats, worst_dd)
+        print(f"{name:<24} {stats['trades']:>7} {stats['win_rate']:>6.1f}% {stats['pf']:>8.3f} {worst_dd:>12.2f}%")
     print("=" * 110)
 
     print("\n" + "=" * 110)
