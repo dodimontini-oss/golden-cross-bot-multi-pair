@@ -7,6 +7,17 @@ forex bot's own baseline numbers, using the SAME risk-management framework
 `multi_pair_bot/bot.py` so the comparison is apples-to-apples on
 methodology even though the entry signal itself is completely different.
 
+!!! BUGFIX 2026-09-10 - EVERY BACKTEST NUMBER FROM RUNS #1-#7 IS WRONG !!!
+`build_daily` stored each trade's entry-bar index as an index into the
+post-slice frame (sliced from the first 21:00 UTC bar), but the simulators
+used it to index the FULL h4 frame. Every trade therefore entered ~285 H4
+bars (~7 weeks) BEFORE its actual signal - correct direction, wrong price
+series - which turned the P&L into near-noise and, e.g., made GBP_CHF look
+robust (it isn't) while making GBP_USD look terrible (it's the best pair).
+The forex_gbpchf_diagnostic.py run exposed it. Fixed here + the exit loops
+rewritten on numpy arrays (10min -> ~1min). project_forex_london_overlap_
+breakout_backtest.md's tables from before this fix are RETRACTED.
+
 Direct follow-up to forex_opening_range_lab.py's finding: on a big-move
 day, the LONDON and OVERLAP H4 bars' own direction matches the day's
 eventual close-to-close direction 82-83% of the time - a real directional
@@ -221,7 +232,16 @@ def build_daily(df: pd.DataFrame) -> pd.DataFrame:
     first_idx = df.index[df["time"].dt.hour == 21]
     if len(first_idx) == 0:
         raise ValueError("no 21:00 UTC bar found - can't align day boundaries")
-    d = df.iloc[first_idx[0]:].reset_index(drop=True)
+    # BUGFIX 2026-09-10: `offset` is the position of the first 21:00 UTC bar in
+    # the FULL df. Every `*_entry_bar_idx` stored below MUST be an index into
+    # that full df, because simulate_pair*/_resolve_trade* index the full `h4`
+    # frame with it. The pre-fix code stored `base + entry_idx` (an index into
+    # the post-slice frame `d`), so every trade entered `offset` bars (~7 weeks
+    # of H4 data) before its actual signal - correct direction, wrong price
+    # series. This silently scrambled every backtest P&L number in this file
+    # and its memory doc; the forex_gbpchf_diagnostic.py run exposed it.
+    offset = first_idx[0]
+    d = df.iloc[offset:].reset_index(drop=True)
     n_days = len(d) // 6
     rows = []
     for i in range(n_days):
@@ -233,7 +253,7 @@ def build_daily(df: pd.DataFrame) -> pd.DataFrame:
             row[f"{label}_range_pct"] = (bar["high"] - bar["low"]) / bar["open"] * 100
             row[f"{label}_vol"] = bar["volume"]
             row[f"{label}_dir"] = 1 if bar["close"] > bar["open"] else (-1 if bar["close"] < bar["open"] else 0)
-            row[f"{label}_entry_bar_idx"] = base + entry_idx
+            row[f"{label}_entry_bar_idx"] = offset + base + entry_idx
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -265,211 +285,162 @@ class Trade:
         self.direction, self.entry_time, self.exit_time, self.r_multiple = direction, entry_time, exit_time, r_multiple
 
 
-def _resolve_trade(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: int, rr_ratio: float = RR_RATIO):
-    """Shared exit-scanning logic: enter at h4.iloc[entry_idx]'s open, ATR
-    taken from the just-closed prior bar, scan forward from the entry bar
-    itself (same-day-resolution fix) for the first stop/target hit. Stop
-    distance is always ATR_STOP_MULT*ATR (unchanged); `rr_ratio` sets how
-    many multiples of that stop distance the target sits at - this is the
-    knob the 2026-09-10 R:R sweep varies, keeping the stop fixed and
-    widening ONLY the target, per the user's request ("wider target
-    instead of 2:1" - not a wider stop).
-    Returns (r_outcome, entry_price, exit_idx) or None if untradeable
-    (ATR not yet warmed up)."""
-    entry_bar = h4.iloc[entry_idx]
-    entry_price = entry_bar["open"]
-    a = atr.iloc[entry_idx - 1] if entry_idx > 0 else float("nan")
-    if pd.isna(a) or a <= 0:
+class _Arrays:
+    """numpy views of an h4 frame + its ATR, built once per pair so the
+    forward-scan exit loops don't pay pandas .iloc overhead per bar (this
+    is what took the pre-numpy version ~10min per full run)."""
+    __slots__ = ("op", "hi", "lo", "cl", "tm", "atr", "n")
+
+    def __init__(self, h4: pd.DataFrame):
+        self.op = h4["open"].to_numpy()
+        self.hi = h4["high"].to_numpy()
+        self.lo = h4["low"].to_numpy()
+        self.cl = h4["close"].to_numpy()
+        self.tm = h4["time"].to_numpy()
+        self.atr = atr_wilder(h4, ATR_LEN).to_numpy()
+        self.n = len(h4)
+
+
+def _resolve_trade(A: "_Arrays", entry_idx: int, direction: int, rr_ratio: float = RR_RATIO):
+    """Fixed-target exit scan. Enter at A.op[entry_idx], ATR from the
+    just-closed prior bar, scan forward from the entry bar itself
+    (same-day-resolution fix). Stop is always ATR_STOP_MULT*ATR; rr_ratio
+    sets the target at that many multiples of the stop distance.
+    Returns (r_outcome, entry_price, exit_idx, stop_dist) or None."""
+    if entry_idx <= 0:
         return None
+    a = A.atr[entry_idx - 1]
+    if not (a > 0):  # also catches NaN
+        return None
+    entry_price = A.op[entry_idx]
     stop_dist = ATR_STOP_MULT * a
     if direction == 1:
         stop_price, target_price = entry_price - stop_dist, entry_price + rr_ratio * stop_dist
     else:
         stop_price, target_price = entry_price + stop_dist, entry_price - rr_ratio * stop_dist
 
-    for j in range(entry_idx, len(h4)):
-        bar = h4.iloc[j]
-        hit_stop = bar["low"] <= stop_price if direction == 1 else bar["high"] >= stop_price
-        hit_target = bar["high"] >= target_price if direction == 1 else bar["low"] <= target_price
-        if hit_stop:  # dual-hit -> conservative: stop wins
-            return -1.0, entry_price, j
-        if hit_target:
-            return rr_ratio, entry_price, j
+    for j in range(entry_idx, A.n):
+        if direction == 1:
+            if A.lo[j] <= stop_price:
+                return -1.0, entry_price, j, stop_dist
+            if A.hi[j] >= target_price:
+                return rr_ratio, entry_price, j, stop_dist
+        else:
+            if A.hi[j] >= stop_price:
+                return -1.0, entry_price, j, stop_dist
+            if A.lo[j] <= target_price:
+                return rr_ratio, entry_price, j, stop_dist
 
-    last = h4.iloc[-1]
-    move = (last["close"] - entry_price) if direction == 1 else (entry_price - last["close"])
-    return move / stop_dist, entry_price, len(h4) - 1
-
-
-def _stop_dist_at(atr: pd.Series, entry_idx: int) -> float:
-    """The ATR*2.0 initial risk distance a trade entered at entry_idx uses -
-    same value _resolve_trade* compute internally, exposed here so the
-    simulate_* functions can turn a per-pair price cost into an R-multiple."""
-    return ATR_STOP_MULT * atr.iloc[entry_idx - 1]
+    move = (A.cl[-1] - entry_price) if direction == 1 else (entry_price - A.cl[-1])
+    return move / stop_dist, entry_price, A.n - 1, stop_dist
 
 
-def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str,
-                  rr_ratio: float = RR_RATIO, cost_mult: float = 0.0):
-    flag_col = f"{label}_{candidate}"
-    dir_col = f"{label}_dir"
-    entry_idx_col = f"{label}_entry_bar_idx"
-    atr = atr_wilder(h4, ATR_LEN)
-
-    trades = []
-    equity_curve = [STARTING_EQUITY]
-    equity = STARTING_EQUITY
-    blocked_until_idx = -1
-
-    for _, day in daily.iterrows():
-        if not bool(day.get(flag_col, False)):
-            continue
-        direction = day[dir_col]
-        if direction == 0:
-            continue
-        entry_idx = int(day[entry_idx_col])
-        if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
-            continue
-        result = _resolve_trade(h4, atr, entry_idx, direction, rr_ratio)
-        if result is None:
-            continue
-        r_outcome, entry_price, exit_idx = result
-        r_outcome -= cost_in_r(pair, _stop_dist_at(atr, entry_idx), cost_mult)
-
-        equity *= (1 + RISK_PCT * r_outcome)
-        equity_curve.append(equity)
-        blocked_until_idx = exit_idx
-        trades.append(Trade(pair, label, candidate, direction, h4.iloc[entry_idx]["time"], h4.iloc[exit_idx]["time"], r_outcome))
-
-    return trades, equity_curve
-
-
-def _resolve_trade_trailing(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: int, chandelier_mult: float):
-    """Chandelier trailing exit: no fixed target. The stop starts at the
-    same ATR_STOP_MULT*ATR initial risk distance used everywhere else in
-    this file (so R-multiples stay comparable to the fixed-R:R results),
-    then ratchets to (peak-since-entry - chandelier_mult*ATR) once that
-    level becomes MORE protective than the initial stop - i.e.
-    stop = max(initial_stop, trailing_level) for a long (min for a short).
-    This means risk is capped at exactly 1R from bar one (same as the
-    fixed-target version), and the trailing stop only ever tightens once
-    the trade is sufficiently in profit for chandelier_mult*ATR of trail
-    room to sit inside the initial risk distance.
-
-    ATR is a single snapshot from the bar before entry (not recomputed
-    bar-by-bar) - consistent with how the initial stop/target distance is
-    computed everywhere else in this file.
-
-    Same look-ahead discipline as _resolve_trade: within a bar, the OLD
-    stop (as of entering that bar) is checked against that bar's low/high
-    FIRST; only if not hit does the peak (and therefore the trailing
-    stop) update using that same bar's extreme, for the NEXT bar's check.
-    Doing it the other way around would optimistically assume the bar's
-    favorable extreme happened before its unfavorable one.
-
-    Returns (r_outcome, entry_price, exit_idx) or None if untradeable."""
-    entry_bar = h4.iloc[entry_idx]
-    entry_price = entry_bar["open"]
-    a = atr.iloc[entry_idx - 1] if entry_idx > 0 else float("nan")
-    if pd.isna(a) or a <= 0:
+def _resolve_trade_trailing(A: "_Arrays", entry_idx: int, direction: int, chandelier_mult: float):
+    """Chandelier trailing exit: no fixed target. Stop starts at the same
+    ATR_STOP_MULT*ATR initial risk distance, then ratchets to
+    (peak-since-entry -/+ chandelier_mult*ATR) once that is more
+    protective. Within a bar the OLD stop is checked FIRST, then the peak
+    (and trailing stop) update from that same bar's extreme for the next
+    bar - no optimistic intrabar ordering.
+    Returns (r_outcome, entry_price, exit_idx, stop_dist) or None."""
+    if entry_idx <= 0:
         return None
-    initial_stop_dist = ATR_STOP_MULT * a
+    a = A.atr[entry_idx - 1]
+    if not (a > 0):
+        return None
+    entry_price = A.op[entry_idx]
+    init_stop_dist = ATR_STOP_MULT * a
     trail_dist = chandelier_mult * a
     peak = entry_price
-    stop_price = entry_price - initial_stop_dist if direction == 1 else entry_price + initial_stop_dist
+    stop_price = entry_price - init_stop_dist if direction == 1 else entry_price + init_stop_dist
 
-    for j in range(entry_idx, len(h4)):
-        bar = h4.iloc[j]
-        hit_stop = bar["low"] <= stop_price if direction == 1 else bar["high"] >= stop_price
-        if hit_stop:
-            move = (stop_price - entry_price) if direction == 1 else (entry_price - stop_price)
-            return move / initial_stop_dist, entry_price, j
+    for j in range(entry_idx, A.n):
         if direction == 1:
-            peak = max(peak, bar["high"])
-            stop_price = max(stop_price, peak - trail_dist)
+            if A.lo[j] <= stop_price:
+                return (stop_price - entry_price) / init_stop_dist, entry_price, j, init_stop_dist
+            if A.hi[j] > peak:
+                peak = A.hi[j]
+            lvl = peak - trail_dist
+            if lvl > stop_price:
+                stop_price = lvl
         else:
-            peak = min(peak, bar["low"])
-            stop_price = min(stop_price, peak + trail_dist)
+            if A.hi[j] >= stop_price:
+                return (entry_price - stop_price) / init_stop_dist, entry_price, j, init_stop_dist
+            if A.lo[j] < peak:
+                peak = A.lo[j]
+            lvl = peak + trail_dist
+            if lvl < stop_price:
+                stop_price = lvl
 
-    last = h4.iloc[-1]
-    move = (last["close"] - entry_price) if direction == 1 else (entry_price - last["close"])
-    return move / initial_stop_dist, entry_price, len(h4) - 1
+    move = (A.cl[-1] - entry_price) if direction == 1 else (entry_price - A.cl[-1])
+    return move / init_stop_dist, entry_price, A.n - 1, init_stop_dist
 
 
-def simulate_pair_trailing(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str,
-                           chandelier_mult: float, cost_mult: float = 0.0):
-    flag_col = f"{label}_{candidate}"
-    dir_col = f"{label}_dir"
-    entry_idx_col = f"{label}_entry_bar_idx"
-    atr = atr_wilder(h4, ATR_LEN)
-
+def _run(pair, label, candidate, A, daily, entry_idx_col, day_direction, resolver, cost_mult):
+    """Shared trade loop. `day_direction(day)` returns +1/-1 if the day
+    fires (0/None if not); `resolver(A, entry_idx, direction)` returns the
+    (r, entry_price, exit_idx, stop_dist) tuple or None."""
     trades = []
     equity_curve = [STARTING_EQUITY]
     equity = STARTING_EQUITY
     blocked_until_idx = -1
-
     for _, day in daily.iterrows():
-        if not bool(day.get(flag_col, False)):
-            continue
-        direction = day[dir_col]
-        if direction == 0:
+        direction = day_direction(day)
+        if not direction:
             continue
         entry_idx = int(day[entry_idx_col])
-        if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
+        if entry_idx <= blocked_until_idx or entry_idx >= A.n:
             continue
-        result = _resolve_trade_trailing(h4, atr, entry_idx, direction, chandelier_mult)
-        if result is None:
+        res = resolver(A, entry_idx, direction)
+        if res is None:
             continue
-        r_outcome, entry_price, exit_idx = result
-        r_outcome -= cost_in_r(pair, _stop_dist_at(atr, entry_idx), cost_mult)
-
+        r_outcome, _entry, exit_idx, stop_dist = res
+        r_outcome -= cost_in_r(pair, stop_dist, cost_mult)
         equity *= (1 + RISK_PCT * r_outcome)
         equity_curve.append(equity)
         blocked_until_idx = exit_idx
-        trades.append(Trade(pair, label, candidate, direction, h4.iloc[entry_idx]["time"], h4.iloc[exit_idx]["time"], r_outcome))
-
+        trades.append(Trade(pair, label, candidate, direction, A.tm[entry_idx], A.tm[exit_idx], r_outcome))
     return trades, equity_curve
 
 
-def simulate_pair_cross(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, candidate: str, cost_mult: float = 0.0):
-    """Cross-window confluence: require LONDON AND OVERLAP to BOTH show the
-    signal on the SAME day AND agree on direction, entering only once
-    OVERLAP has closed (the later of the two signal bars). A genuinely
-    different idea from relvol_and_range (which combined two signals on
-    ONE window and didn't help, because RELVOL and RANGE on a single bar
-    are highly correlated by construction) - LONDON and OVERLAP are
-    different bars four hours apart, shown to fire on partly independent
-    subsets of days in forex_opening_range_lab.py's original screen."""
-    flag_a, flag_b = f"LONDON_{candidate}", f"OVERLAP_{candidate}"
-    entry_idx_col = "OVERLAP_entry_bar_idx"
-    atr = atr_wilder(h4, ATR_LEN)
+def _arrays(h4):
+    return h4 if isinstance(h4, _Arrays) else _Arrays(h4)
 
-    trades = []
-    equity_curve = [STARTING_EQUITY]
-    equity = STARTING_EQUITY
-    blocked_until_idx = -1
 
-    for _, day in daily.iterrows():
-        if not (bool(day.get(flag_a, False)) and bool(day.get(flag_b, False))):
-            continue
-        london_dir, overlap_dir = day["LONDON_dir"], day["OVERLAP_dir"]
-        if london_dir == 0 or london_dir != overlap_dir:
-            continue
-        direction = overlap_dir
-        entry_idx = int(day[entry_idx_col])
-        if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
-            continue
-        result = _resolve_trade(h4, atr, entry_idx, direction)
-        if result is None:
-            continue
-        r_outcome, entry_price, exit_idx = result
-        r_outcome -= cost_in_r(pair, _stop_dist_at(atr, entry_idx), cost_mult)
+def _single_window_dir(flag_col, dir_col):
+    def f(day):
+        return int(day[dir_col]) if bool(day.get(flag_col, False)) else 0
+    return f
 
-        equity *= (1 + RISK_PCT * r_outcome)
-        equity_curve.append(equity)
-        blocked_until_idx = exit_idx
-        trades.append(Trade(pair, "CROSS", candidate, direction, h4.iloc[entry_idx]["time"], h4.iloc[exit_idx]["time"], r_outcome))
 
-    return trades, equity_curve
+def _cross_window_dir(candidate):
+    fa, fb = f"LONDON_{candidate}", f"OVERLAP_{candidate}"
+    def f(day):
+        if not (bool(day.get(fa, False)) and bool(day.get(fb, False))):
+            return 0
+        ld, od = int(day["LONDON_dir"]), int(day["OVERLAP_dir"])
+        return od if (ld != 0 and ld == od) else 0
+    return f
+
+
+def simulate_pair(pair, h4, daily, label, candidate, rr_ratio=RR_RATIO, cost_mult=0.0):
+    return _run(pair, label, candidate, _arrays(h4), daily, f"{label}_entry_bar_idx",
+                _single_window_dir(f"{label}_{candidate}", f"{label}_dir"),
+                lambda A, ei, d: _resolve_trade(A, ei, d, rr_ratio), cost_mult)
+
+
+def simulate_pair_trailing(pair, h4, daily, label, candidate, chandelier_mult, cost_mult=0.0):
+    return _run(pair, label, candidate, _arrays(h4), daily, f"{label}_entry_bar_idx",
+                _single_window_dir(f"{label}_{candidate}", f"{label}_dir"),
+                lambda A, ei, d: _resolve_trade_trailing(A, ei, d, chandelier_mult), cost_mult)
+
+
+def simulate_pair_cross(pair, h4, daily, candidate, cost_mult=0.0):
+    """Cross-window confluence: LONDON AND OVERLAP both fire the same signal
+    AND agree on direction; enter once OVERLAP (the later bar) has closed."""
+    return _run(pair, "CROSS", candidate, _arrays(h4), daily, "OVERLAP_entry_bar_idx",
+                _cross_window_dir(candidate),
+                lambda A, ei, d: _resolve_trade(A, ei, d), cost_mult)
 
 
 def pf_stats(trades: list) -> dict:
@@ -497,7 +468,9 @@ def main():
     for pair in PAIRS:
         h4 = get_candles_range(pair, FROM_TIME)
         daily = add_day_flags(build_daily(h4))
-        per_pair_h4[pair], per_pair_daily[pair] = h4, daily
+        # build the numpy views ONCE per pair (ATR's wilder_rma is a slow
+        # Python loop; the sweeps call the simulators ~100x per pair)
+        per_pair_h4[pair], per_pair_daily[pair] = _Arrays(h4), daily
         print(f"  {pair}: {len(h4)} H4 bars -> {len(daily)} days, {h4['time'].iloc[0]} to {h4['time'].iloc[-1]}")
         time.sleep(0.3)
 
