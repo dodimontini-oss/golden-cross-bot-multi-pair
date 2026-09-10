@@ -96,10 +96,19 @@ first genuine pass in the whole arc - LONDON_RELVOL@CH=3.0 clears both
 walk-forward halves (pooled 1.157, early 1.224, late 1.093).
 
 UPDATE 2026-09-10 (fifth): added a PER-PAIR BREAKDOWN of the LONDON
-trailing candidates (user: "run the per-pair check next") - does the
-pooled pass hold up pair-by-pair, or is 1-2 pairs carrying it? Also
-trimmed RR_SWEEP to [2.0, 6.0] this run since the full R:R sweep is
-already recorded and was slow.
+trailing candidates (user: "run the per-pair check next") - 6/9 pairs
+pass both halves for LONDON_RELVOL@CH=3.0, and it survives dropping the
+strongest pair. Neighbour CH multiples collapse to 2-3/9, so CH=3.0 is a
+real sweet spot, not a cherry-pick.
+
+UPDATE 2026-09-10 (sixth): added TRANSACTION COST MODELLING (user: "yes
+add cost modeling"). `cost_in_r()` + `COST_SCENARIOS`: per-pair round-trip
+= full quoted spread (mid-to-mid) + 0.5pip/side slippage, converted to
+R-multiples and subtracted from every trade. Every table now shows
+frictionless vs. realistic-cost PF, plus a cost-sensitivity sweep
+(frictionless / realistic / pessimistic 1.5x). The R:R sweep is dropped
+from this run (fully recorded, clean fail). THIS is the run that decides
+whether LONDON_RELVOL@CH=3.0 is real or just a no-cost artefact.
 
 Run (needs OANDA_API_KEY):
     python forex_london_overlap_breakout_lab.py
@@ -135,13 +144,37 @@ PCTL_THRESH = 0.20
 # starting 21:00 UTC: [21:00, 01:00, 05:00, 09:00, 13:00, 17:00]
 OR_WINDOWS = [("LONDON", 3, 4), ("OVERLAP", 4, 5)]
 CANDIDATE_TYPES = ["relvol", "range_top20", "relvol_and_range"]
-# RR_SWEEP trimmed to [2.0, 6.0] for the 2026-09-10 per-pair-check run - the full
-# 7-point sweep is already recorded (pooled PF climbs to 1.26 at RR=6 but it's an
-# early-half-only illusion that fails walk-forward). Keeping RR=2 (baseline) and
-# RR=6 here just as a one-line reminder of that failure mode alongside the trailing
-# results, without paying the full sweep's ~2.5min runtime again.
-RR_SWEEP = [2.0, 6.0]
 CHANDELIER_SWEEP = [2.0, 3.0, 4.0, 5.0]  # trailing distance (x ATR from peak); 3.0 matches the live-bot-family default
+
+# --- transaction cost model (added 2026-09-10, user: "yes add cost modeling") ---
+# Every result before this run was frictionless. Per-pair round-trip cost is
+# modeled as: cross the full quoted spread once (mid-to-mid, since the backtest
+# uses OANDA mid candles) + a fixed slippage allowance on each side. The spread
+# figures are deliberately a touch WIDER than OANDA fxpractice typically shows
+# on majors, because a trailing-stop strategy exits on stop orders (which slip
+# in fast markets) far more often than on resting limit targets. Cost is
+# converted to R-multiples per trade (fraction of the ATR*2.0 initial risk
+# distance) and subtracted from every trade's gross outcome.
+SPREAD_PIPS = {
+    "GBP_CHF": 2.5, "GBP_CAD": 2.6, "GBP_USD": 1.3, "GBP_JPY": 2.2, "GBP_AUD": 2.8,
+    "USD_CHF": 1.6, "EUR_USD": 0.9, "EUR_AUD": 1.9, "AUD_NZD": 2.4,
+}
+SLIPPAGE_PIPS_PER_SIDE = 0.5  # -> +1.0 pip added to the round trip
+PIP_SIZE = {p: (0.01 if p.endswith("_JPY") else 0.0001) for p in PAIRS}
+# multiplier on the whole round-trip cost, for the sensitivity sweep
+COST_SCENARIOS = {"frictionless": 0.0, "realistic": 1.0, "pessimistic": 1.5}
+
+
+def cost_in_r(pair: str, stop_dist: float, cost_mult: float) -> float:
+    """Round-trip transaction cost for one trade, expressed in R (fraction of
+    the ATR*2.0 initial risk distance, so it's directly subtractable from the
+    R-multiple trade outcomes used throughout this file). cost_mult scales it
+    for the scenario sweep (0.0 reproduces the old frictionless numbers)."""
+    if cost_mult == 0.0:
+        return 0.0
+    rt_pips = SPREAD_PIPS[pair] + 2 * SLIPPAGE_PIPS_PER_SIDE
+    rt_price = rt_pips * PIP_SIZE[pair]
+    return cost_mult * rt_price / stop_dist
 
 
 def get_candles_range(instrument: str, from_time: str) -> pd.DataFrame:
@@ -268,7 +301,15 @@ def _resolve_trade(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: 
     return move / stop_dist, entry_price, len(h4) - 1
 
 
-def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str, rr_ratio: float = RR_RATIO):
+def _stop_dist_at(atr: pd.Series, entry_idx: int) -> float:
+    """The ATR*2.0 initial risk distance a trade entered at entry_idx uses -
+    same value _resolve_trade* compute internally, exposed here so the
+    simulate_* functions can turn a per-pair price cost into an R-multiple."""
+    return ATR_STOP_MULT * atr.iloc[entry_idx - 1]
+
+
+def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str,
+                  rr_ratio: float = RR_RATIO, cost_mult: float = 0.0):
     flag_col = f"{label}_{candidate}"
     dir_col = f"{label}_dir"
     entry_idx_col = f"{label}_entry_bar_idx"
@@ -292,6 +333,7 @@ def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, 
         if result is None:
             continue
         r_outcome, entry_price, exit_idx = result
+        r_outcome -= cost_in_r(pair, _stop_dist_at(atr, entry_idx), cost_mult)
 
         equity *= (1 + RISK_PCT * r_outcome)
         equity_curve.append(equity)
@@ -353,7 +395,8 @@ def _resolve_trade_trailing(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, di
     return move / initial_stop_dist, entry_price, len(h4) - 1
 
 
-def simulate_pair_trailing(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str, chandelier_mult: float):
+def simulate_pair_trailing(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str,
+                           chandelier_mult: float, cost_mult: float = 0.0):
     flag_col = f"{label}_{candidate}"
     dir_col = f"{label}_dir"
     entry_idx_col = f"{label}_entry_bar_idx"
@@ -377,6 +420,7 @@ def simulate_pair_trailing(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, lab
         if result is None:
             continue
         r_outcome, entry_price, exit_idx = result
+        r_outcome -= cost_in_r(pair, _stop_dist_at(atr, entry_idx), cost_mult)
 
         equity *= (1 + RISK_PCT * r_outcome)
         equity_curve.append(equity)
@@ -386,7 +430,7 @@ def simulate_pair_trailing(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, lab
     return trades, equity_curve
 
 
-def simulate_pair_cross(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, candidate: str):
+def simulate_pair_cross(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, candidate: str, cost_mult: float = 0.0):
     """Cross-window confluence: require LONDON AND OVERLAP to BOTH show the
     signal on the SAME day AND agree on direction, entering only once
     OVERLAP has closed (the later of the two signal bars). A genuinely
@@ -418,6 +462,7 @@ def simulate_pair_cross(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, candid
         if result is None:
             continue
         r_outcome, entry_price, exit_idx = result
+        r_outcome -= cost_in_r(pair, _stop_dist_at(atr, entry_idx), cost_mult)
 
         equity *= (1 + RISK_PCT * r_outcome)
         equity_curve.append(equity)
@@ -456,48 +501,54 @@ def main():
         print(f"  {pair}: {len(h4)} H4 bars -> {len(daily)} days, {h4['time'].iloc[0]} to {h4['time'].iloc[-1]}")
         time.sleep(0.3)
 
+    realistic = COST_SCENARIOS["realistic"]
+
     print("\n" + "=" * 110)
     print("LONDON / OVERLAP BREAKOUT BACKTEST vs. deployed golden-cross-bot-multi-pair")
     print("Same risk framework: ATR*2.0 stop, ATR*4.0 target (2:1 R:R), 1% risk/trade, per-pair independent equity")
+    print("PF shown BOTH frictionless (old numbers) and with the realistic per-pair spread+slippage cost model")
     print("Reference (memory, same per-pair-independent methodology): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320")
     print("=" * 110)
-    print(f"{'Candidate':<24} {'Trades':>7} {'Win%':>7} {'PF':>8} {'WorstPairDD%':>13}")
+    print(f"{'Candidate':<24} {'Trades':>7} {'Win%':>7} {'PF(free)':>9} {'PF(cost)':>9} {'WorstPairDD%(cost)':>18}")
     print("-" * 110)
 
-    all_results = {}
+    all_results = {}          # realistic-cost trade lists, consumed by walk-forward + per-pair below
     for label, _, _ in OR_WINDOWS:
         for candidate in CANDIDATE_TYPES:
-            pooled_trades = []
-            dds = []
+            free_trades, cost_trades, dds = [], [], []
             for pair in PAIRS:
-                trades, curve = simulate_pair(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate)
-                pooled_trades.extend(trades)
+                ft, _ = simulate_pair(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, cost_mult=0.0)
+                ct, curve = simulate_pair(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, cost_mult=realistic)
+                free_trades.extend(ft)
+                cost_trades.extend(ct)
                 if len(curve) > 1:
                     dds.append(max_dd_pct(curve))
-            stats = pf_stats(pooled_trades)
+            fs, cs = pf_stats(free_trades), pf_stats(cost_trades)
             worst_dd = max(dds) if dds else float("nan")
             name = f"{label}_{candidate.upper()}"
-            all_results[name] = (pooled_trades, stats, worst_dd)
-            print(f"{name:<24} {stats['trades']:>7} {stats['win_rate']:>6.1f}% {stats['pf']:>8.3f} {worst_dd:>12.2f}%")
+            all_results[name] = (cost_trades, cs, worst_dd)
+            print(f"{name:<24} {cs['trades']:>7} {cs['win_rate']:>6.1f}% {fs['pf']:>9.3f} {cs['pf']:>9.3f} {worst_dd:>17.2f}%")
 
     # CROSS-WINDOW confluence: LONDON and OVERLAP both fire AND agree on direction.
     for candidate in ("relvol", "range_top20"):
-        pooled_trades = []
-        dds = []
+        free_trades, cost_trades, dds = [], [], []
         for pair in PAIRS:
-            trades, curve = simulate_pair_cross(pair, per_pair_h4[pair], per_pair_daily[pair], candidate)
-            pooled_trades.extend(trades)
+            ft, _ = simulate_pair_cross(pair, per_pair_h4[pair], per_pair_daily[pair], candidate, cost_mult=0.0)
+            ct, curve = simulate_pair_cross(pair, per_pair_h4[pair], per_pair_daily[pair], candidate, cost_mult=realistic)
+            free_trades.extend(ft)
+            cost_trades.extend(ct)
             if len(curve) > 1:
                 dds.append(max_dd_pct(curve))
-        stats = pf_stats(pooled_trades)
+        fs = pf_stats(free_trades)
+        stats = pf_stats(cost_trades)
         worst_dd = max(dds) if dds else float("nan")
         name = f"CROSS_{candidate.upper()}"
-        all_results[name] = (pooled_trades, stats, worst_dd)
-        print(f"{name:<24} {stats['trades']:>7} {stats['win_rate']:>6.1f}% {stats['pf']:>8.3f} {worst_dd:>12.2f}%")
+        all_results[name] = (cost_trades, stats, worst_dd)
+        print(f"{name:<24} {stats['trades']:>7} {stats['win_rate']:>6.1f}% {fs['pf']:>9.3f} {stats['pf']:>9.3f} {worst_dd:>17.2f}%")
     print("=" * 110)
 
     print("\n" + "=" * 110)
-    print("WALK-FORWARD CHECK (split at pooled-trade time median per candidate)")
+    print("WALK-FORWARD CHECK - REALISTIC COST (split at pooled-trade time median per candidate)")
     print("=" * 110)
     print(f"{'Candidate':<24} {'EarlyTrades':>11} {'EarlyPF':>9} {'LateTrades':>11} {'LatePF':>9}")
     print("-" * 110)
@@ -514,7 +565,7 @@ def main():
     print("=" * 110)
 
     print("\n" + "=" * 110)
-    print("PER-PAIR BREAKDOWN (does it hold up pair-by-pair?)")
+    print("PER-PAIR BREAKDOWN - REALISTIC COST (does it hold up pair-by-pair with spread/slippage?)")
     print("=" * 110)
     for name, (trades, stats, worst_dd) in all_results.items():
         print(f"\n{name}:")
@@ -524,98 +575,65 @@ def main():
             print(f"  {pair:<10} trades={s['trades']:>4}  win%={s['win_rate']:>5.1f}  PF={s['pf']:>6.3f}")
     print("=" * 110 + "\n")
 
-    # -----------------------------------------------------------------
-    # R:R SWEEP (2026-09-10, user follow-up): every result above used a
-    # fixed 2:1 target (RR_RATIO=2.0, i.e. target = 4x ATR against a 2x
-    # ATR stop) inherited from the live bot's own risk framework. Stop
-    # distance stays fixed at ATR*2.0 throughout this sweep - only the
-    # TARGET multiple varies - testing whether a wider (or narrower)
-    # target changes the picture for the two single-window candidates
-    # that came closest to breakeven (LONDON_RELVOL, LONDON_RANGE_TOP20)
-    # plus the two OVERLAP equivalents for contrast. Skips the
-    # relvol_and_range/CROSS variants - they were strictly worse than
-    # their single-signal counterparts at RR=2.0, no reason to re-sweep them.
-    # -----------------------------------------------------------------
-    print("\n" + "=" * 110)
-    print("R:R SWEEP - stop fixed at ATR*2.0, target multiple varies (2.0 = the baseline used everywhere above)")
-    print("=" * 110)
+    # R:R sweep removed from this run - fully recorded in
+    # project_forex_london_overlap_breakout_backtest.md (clean fail: a wider
+    # fixed target is an early-half-only illusion that fails walk-forward).
+
     sweep_candidates = [("LONDON", "relvol"), ("LONDON", "range_top20"), ("OVERLAP", "relvol"), ("OVERLAP", "range_top20")]
-    print(f"{'Candidate':<20} " + " ".join(f"RR={rr:<4.1f}" for rr in RR_SWEEP))
-    print("-" * 110)
-    sweep_results = {}
-    for label, candidate in sweep_candidates:
-        row_pf, row_trades = [], []
-        for rr in RR_SWEEP:
-            pooled_trades = []
-            for pair in PAIRS:
-                trades, _ = simulate_pair(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, rr_ratio=rr)
-                pooled_trades.extend(trades)
-            stats = pf_stats(pooled_trades)
-            sweep_results[(label, candidate, rr)] = pooled_trades
-            row_pf.append(stats["pf"])
-            row_trades.append(stats["trades"])
-        name = f"{label}_{candidate.upper()}"
-        print(f"{name:<20} " + " ".join(f"{pf:6.3f}" for pf in row_pf))
-        print(f"{'  (n trades)':<20} " + " ".join(f"{n:6d}" for n in row_trades))
-    print("=" * 110)
-
-    print("\n" + "=" * 110)
-    print("R:R SWEEP - WALK-FORWARD CHECK on every cell above (early/late PF)")
-    print("=" * 110)
-    print(f"{'Candidate':<20} {'RR':>5} {'EarlyTr':>8} {'EarlyPF':>9} {'LateTr':>8} {'LatePF':>9}")
-    print("-" * 110)
-    for label, candidate in sweep_candidates:
-        for rr in RR_SWEEP:
-            trades = sweep_results[(label, candidate, rr)]
-            if len(trades) < 10:
-                print(f"{label}_{candidate.upper():<12} {rr:>5.1f}  SKIP - too few trades ({len(trades)})")
-                continue
-            times = sorted(t.entry_time for t in trades)
-            mid = times[len(times) // 2]
-            early = [t for t in trades if t.entry_time < mid]
-            late = [t for t in trades if t.entry_time >= mid]
-            es, ls = pf_stats(early), pf_stats(late)
-            print(f"{label + '_' + candidate.upper():<20} {rr:>5.1f} {es['trades']:>8} {es['pf']:>9.3f} {ls['trades']:>8} {ls['pf']:>9.3f}")
-    print("=" * 110)
-    print("Reference (memory, same per-pair-independent methodology): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320\n")
 
     # -----------------------------------------------------------------
-    # TRAILING EXIT SWEEP (2026-09-10, user follow-up: "try the trailing
-    # exit instead"). No fixed target at all - a chandelier stop trails
-    # peak-since-entry by chandelier_mult*ATR, only taking over once it's
-    # more protective than the initial ATR*2.0 risk stop (see
-    # _resolve_trade_trailing's docstring). The R:R sweep just above
-    # showed a wider FIXED target creates an early-half-only illusion of
-    # improvement that fails walk-forward - a trailing exit is a
-    # genuinely different mechanism (it can bank a smaller profit quickly
-    # on a choppy trade, or ride a real trend indefinitely), not just
-    # "the same idea with a bigger number," so it's not assumed to fail
-    # the same way.
+    # TRAILING EXIT SWEEP - now WITH the realistic cost model. The
+    # frictionless version of this (run #5/#6) was the first walk-forward
+    # pass in the arc (LONDON_RELVOL@CH=3.0, pooled 1.157, 6/9 pairs). The
+    # question this run answers: does that survive spread + slippage? A
+    # trailing exit takes many small partial-profit exits, so it's more
+    # cost-exposed than a fixed 2:1 target - this is the real test.
     # -----------------------------------------------------------------
     print("\n" + "=" * 110)
-    print("TRAILING EXIT SWEEP - chandelier trail distance varies, no fixed target (vs. fixed-target results above)")
+    print("TRAILING EXIT SWEEP - REALISTIC COST - chandelier trail distance varies, no fixed target")
+    print("(PF shown frictionless / realistic-cost for each cell)")
     print("=" * 110)
-    print(f"{'Candidate':<20} " + " ".join(f"CH={c:<4.1f}" for c in CHANDELIER_SWEEP))
+    print(f"{'Candidate':<20} " + " ".join(f"CH={c:<10.1f}" for c in CHANDELIER_SWEEP))
     print("-" * 110)
-    trail_results = {}
+    trail_results = {}           # realistic-cost trade lists, consumed by the sections below
     for label, candidate in sweep_candidates:
-        row_pf, row_trades = [], []
+        cells = []
         for ch in CHANDELIER_SWEEP:
-            pooled_trades = []
+            free_trades, cost_trades = [], []
             for pair in PAIRS:
-                trades, _ = simulate_pair_trailing(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, chandelier_mult=ch)
-                pooled_trades.extend(trades)
-            stats = pf_stats(pooled_trades)
-            trail_results[(label, candidate, ch)] = pooled_trades
-            row_pf.append(stats["pf"])
-            row_trades.append(stats["trades"])
+                ft, _ = simulate_pair_trailing(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, chandelier_mult=ch, cost_mult=0.0)
+                ct, _ = simulate_pair_trailing(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, chandelier_mult=ch, cost_mult=realistic)
+                free_trades.extend(ft)
+                cost_trades.extend(ct)
+            trail_results[(label, candidate, ch)] = cost_trades
+            cells.append(f"{pf_stats(free_trades)['pf']:.3f}/{pf_stats(cost_trades)['pf']:.3f}")
         name = f"{label}_{candidate.upper()}"
-        print(f"{name:<20} " + " ".join(f"{pf:6.3f}" for pf in row_pf))
-        print(f"{'  (n trades)':<20} " + " ".join(f"{n:6d}" for n in row_trades))
+        print(f"{name:<20} " + " ".join(f"{c:<13}" for c in cells))
+    print("=" * 110)
+
+    # cost-sensitivity: the standout LONDON candidates across all three cost scenarios
+    print("\n" + "=" * 110)
+    print("COST SENSITIVITY - LONDON candidates, PF at each cost scenario")
+    print(f"(scenarios: {', '.join(f'{k}={v}x' for k, v in COST_SCENARIOS.items())}; "
+          f"realistic = per-pair spread {min(SPREAD_PIPS.values())}-{max(SPREAD_PIPS.values())}pips + "
+          f"{SLIPPAGE_PIPS_PER_SIDE}pip/side slippage)")
+    print("=" * 110)
+    print(f"{'Candidate':<20} {'CH':>5} " + " ".join(f"{s:>13}" for s in COST_SCENARIOS))
+    print("-" * 110)
+    for label, candidate in [("LONDON", "relvol"), ("LONDON", "range_top20")]:
+        for ch in (2.0, 3.0, 4.0):  # CH=3.0 is the standout; 2.0/4.0 for context
+            pfs = []
+            for scen, mult in COST_SCENARIOS.items():
+                pooled = []
+                for pair in PAIRS:
+                    tr, _ = simulate_pair_trailing(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, chandelier_mult=ch, cost_mult=mult)
+                    pooled.extend(tr)
+                pfs.append(pf_stats(pooled)["pf"])
+            print(f"{label + '_' + candidate.upper():<20} {ch:>5.1f} " + " ".join(f"{p:>13.3f}" for p in pfs))
     print("=" * 110)
 
     print("\n" + "=" * 110)
-    print("TRAILING EXIT SWEEP - WALK-FORWARD CHECK on every cell above (early/late PF)")
+    print("TRAILING EXIT SWEEP - WALK-FORWARD CHECK - REALISTIC COST (early/late PF on every cell above)")
     print("=" * 110)
     print(f"{'Candidate':<20} {'CH':>5} {'EarlyTr':>8} {'EarlyPF':>9} {'LateTr':>8} {'LatePF':>9}")
     print("-" * 110)
@@ -646,7 +664,7 @@ def main():
     # pair's own trade-time median as its early/late split.
     # -----------------------------------------------------------------
     print("\n" + "=" * 110)
-    print("TRAILING EXIT - PER-PAIR BREAKDOWN of the LONDON candidates (does the pooled pass hold up pair-by-pair?)")
+    print("TRAILING EXIT - PER-PAIR BREAKDOWN - REALISTIC COST (does the pooled pass survive costs pair-by-pair?)")
     print("=" * 110)
     for label, candidate in [("LONDON", "relvol"), ("LONDON", "range_top20")]:
         for ch in CHANDELIER_SWEEP:
@@ -670,8 +688,10 @@ def main():
                 print(f"  {pair:<10} {s['trades']:>7} {s['pf']:>8.3f} {e['pf']:>9.3f} {l['pf']:>9.3f}   {'YES' if ok else 'no'}")
             print(f"  -> {n_pass}/9 pairs pass both walk-forward halves individually")
     print("=" * 110)
-    print("Reference (memory): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320. "
-          "1% risk/trade, per-pair independent equity, NO spread/slippage modeled.\n")
+    print("Reference (memory): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320 - those come from")
+    print("golden_cross_portfolio_lab.py, which models only fee=0.00005 (~0.5bp/side, ~0.05-0.1pip) - MUCH tighter than")
+    print("this run's per-pair spread+slippage model. So: this run's frictionless column ~ their cost basis; this run's")
+    print("realistic column is a deliberately harsher, more deployment-honest test than the reference bot ever faced.\n")
 
 
 if __name__ == "__main__":
