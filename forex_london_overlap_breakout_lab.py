@@ -82,9 +82,20 @@ bottleneck is the fixed 2:1 exit structure, not insufficient selectivity.
 UPDATE 2026-09-10 (third): added an R:R SWEEP (`RR_SWEEP`, stop fixed at
 ATR*2.0, only the target multiple varies) on the four single-window
 candidates, since selectivity was now ruled out as the lever to pull.
-See the printed "R:R SWEEP" section for results - this is the first test
-in this line of research where the STOP/TARGET STRUCTURE itself changes
-rather than which days get selected.
+UPDATE: the pooled PF looked like it improved with a wider target (up to
+1.256 at RR=6.0 on LONDON_RELVOL) but walk-forward showed this was
+ENTIRELY an early-half (2015-~2020) effect - the late half stayed stuck
+at 0.93-1.07 across the whole sweep. Rejected as an overfitting trap, not
+a real edge.
+
+UPDATE 2026-09-10 (fourth): added a TRAILING EXIT sweep via
+`simulate_pair_trailing()`/`_resolve_trade_trailing()` - a chandelier
+stop (no fixed target) trailing peak-since-entry by `chandelier_mult`*ATR,
+per the user's "try the trailing exit instead." A genuinely different
+mechanism from a wider fixed target (can bank a small profit quickly on
+a choppy trade, or ride a real trend as far as it goes), tested on the
+same four single-window candidates. See the printed "TRAILING EXIT
+SWEEP" section for results.
 
 Run (needs OANDA_API_KEY):
     python forex_london_overlap_breakout_lab.py
@@ -121,6 +132,7 @@ PCTL_THRESH = 0.20
 OR_WINDOWS = [("LONDON", 3, 4), ("OVERLAP", 4, 5)]
 CANDIDATE_TYPES = ["relvol", "range_top20", "relvol_and_range"]
 RR_SWEEP = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0]  # stop fixed at ATR*2.0; only the target multiple varies
+CHANDELIER_SWEEP = [2.0, 3.0, 4.0, 5.0]  # trailing distance (x ATR from peak); 3.0 matches the live-bot-family default
 
 
 def get_candles_range(instrument: str, from_time: str) -> pd.DataFrame:
@@ -268,6 +280,91 @@ def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, 
         if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
             continue
         result = _resolve_trade(h4, atr, entry_idx, direction, rr_ratio)
+        if result is None:
+            continue
+        r_outcome, entry_price, exit_idx = result
+
+        equity *= (1 + RISK_PCT * r_outcome)
+        equity_curve.append(equity)
+        blocked_until_idx = exit_idx
+        trades.append(Trade(pair, label, candidate, direction, h4.iloc[entry_idx]["time"], h4.iloc[exit_idx]["time"], r_outcome))
+
+    return trades, equity_curve
+
+
+def _resolve_trade_trailing(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: int, chandelier_mult: float):
+    """Chandelier trailing exit: no fixed target. The stop starts at the
+    same ATR_STOP_MULT*ATR initial risk distance used everywhere else in
+    this file (so R-multiples stay comparable to the fixed-R:R results),
+    then ratchets to (peak-since-entry - chandelier_mult*ATR) once that
+    level becomes MORE protective than the initial stop - i.e.
+    stop = max(initial_stop, trailing_level) for a long (min for a short).
+    This means risk is capped at exactly 1R from bar one (same as the
+    fixed-target version), and the trailing stop only ever tightens once
+    the trade is sufficiently in profit for chandelier_mult*ATR of trail
+    room to sit inside the initial risk distance.
+
+    ATR is a single snapshot from the bar before entry (not recomputed
+    bar-by-bar) - consistent with how the initial stop/target distance is
+    computed everywhere else in this file.
+
+    Same look-ahead discipline as _resolve_trade: within a bar, the OLD
+    stop (as of entering that bar) is checked against that bar's low/high
+    FIRST; only if not hit does the peak (and therefore the trailing
+    stop) update using that same bar's extreme, for the NEXT bar's check.
+    Doing it the other way around would optimistically assume the bar's
+    favorable extreme happened before its unfavorable one.
+
+    Returns (r_outcome, entry_price, exit_idx) or None if untradeable."""
+    entry_bar = h4.iloc[entry_idx]
+    entry_price = entry_bar["open"]
+    a = atr.iloc[entry_idx - 1] if entry_idx > 0 else float("nan")
+    if pd.isna(a) or a <= 0:
+        return None
+    initial_stop_dist = ATR_STOP_MULT * a
+    trail_dist = chandelier_mult * a
+    peak = entry_price
+    stop_price = entry_price - initial_stop_dist if direction == 1 else entry_price + initial_stop_dist
+
+    for j in range(entry_idx, len(h4)):
+        bar = h4.iloc[j]
+        hit_stop = bar["low"] <= stop_price if direction == 1 else bar["high"] >= stop_price
+        if hit_stop:
+            move = (stop_price - entry_price) if direction == 1 else (entry_price - stop_price)
+            return move / initial_stop_dist, entry_price, j
+        if direction == 1:
+            peak = max(peak, bar["high"])
+            stop_price = max(stop_price, peak - trail_dist)
+        else:
+            peak = min(peak, bar["low"])
+            stop_price = min(stop_price, peak + trail_dist)
+
+    last = h4.iloc[-1]
+    move = (last["close"] - entry_price) if direction == 1 else (entry_price - last["close"])
+    return move / initial_stop_dist, entry_price, len(h4) - 1
+
+
+def simulate_pair_trailing(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str, chandelier_mult: float):
+    flag_col = f"{label}_{candidate}"
+    dir_col = f"{label}_dir"
+    entry_idx_col = f"{label}_entry_bar_idx"
+    atr = atr_wilder(h4, ATR_LEN)
+
+    trades = []
+    equity_curve = [STARTING_EQUITY]
+    equity = STARTING_EQUITY
+    blocked_until_idx = -1
+
+    for _, day in daily.iterrows():
+        if not bool(day.get(flag_col, False)):
+            continue
+        direction = day[dir_col]
+        if direction == 0:
+            continue
+        entry_idx = int(day[entry_idx_col])
+        if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
+            continue
+        result = _resolve_trade_trailing(h4, atr, entry_idx, direction, chandelier_mult)
         if result is None:
             continue
         r_outcome, entry_price, exit_idx = result
@@ -470,6 +567,61 @@ def main():
             late = [t for t in trades if t.entry_time >= mid]
             es, ls = pf_stats(early), pf_stats(late)
             print(f"{label + '_' + candidate.upper():<20} {rr:>5.1f} {es['trades']:>8} {es['pf']:>9.3f} {ls['trades']:>8} {ls['pf']:>9.3f}")
+    print("=" * 110)
+    print("Reference (memory, same per-pair-independent methodology): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320\n")
+
+    # -----------------------------------------------------------------
+    # TRAILING EXIT SWEEP (2026-09-10, user follow-up: "try the trailing
+    # exit instead"). No fixed target at all - a chandelier stop trails
+    # peak-since-entry by chandelier_mult*ATR, only taking over once it's
+    # more protective than the initial ATR*2.0 risk stop (see
+    # _resolve_trade_trailing's docstring). The R:R sweep just above
+    # showed a wider FIXED target creates an early-half-only illusion of
+    # improvement that fails walk-forward - a trailing exit is a
+    # genuinely different mechanism (it can bank a smaller profit quickly
+    # on a choppy trade, or ride a real trend indefinitely), not just
+    # "the same idea with a bigger number," so it's not assumed to fail
+    # the same way.
+    # -----------------------------------------------------------------
+    print("\n" + "=" * 110)
+    print("TRAILING EXIT SWEEP - chandelier trail distance varies, no fixed target (vs. fixed-target results above)")
+    print("=" * 110)
+    print(f"{'Candidate':<20} " + " ".join(f"CH={c:<4.1f}" for c in CHANDELIER_SWEEP))
+    print("-" * 110)
+    trail_results = {}
+    for label, candidate in sweep_candidates:
+        row_pf, row_trades = [], []
+        for ch in CHANDELIER_SWEEP:
+            pooled_trades = []
+            for pair in PAIRS:
+                trades, _ = simulate_pair_trailing(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, chandelier_mult=ch)
+                pooled_trades.extend(trades)
+            stats = pf_stats(pooled_trades)
+            trail_results[(label, candidate, ch)] = pooled_trades
+            row_pf.append(stats["pf"])
+            row_trades.append(stats["trades"])
+        name = f"{label}_{candidate.upper()}"
+        print(f"{name:<20} " + " ".join(f"{pf:6.3f}" for pf in row_pf))
+        print(f"{'  (n trades)':<20} " + " ".join(f"{n:6d}" for n in row_trades))
+    print("=" * 110)
+
+    print("\n" + "=" * 110)
+    print("TRAILING EXIT SWEEP - WALK-FORWARD CHECK on every cell above (early/late PF)")
+    print("=" * 110)
+    print(f"{'Candidate':<20} {'CH':>5} {'EarlyTr':>8} {'EarlyPF':>9} {'LateTr':>8} {'LatePF':>9}")
+    print("-" * 110)
+    for label, candidate in sweep_candidates:
+        for ch in CHANDELIER_SWEEP:
+            trades = trail_results[(label, candidate, ch)]
+            if len(trades) < 10:
+                print(f"{label}_{candidate.upper():<12} {ch:>5.1f}  SKIP - too few trades ({len(trades)})")
+                continue
+            times = sorted(t.entry_time for t in trades)
+            mid = times[len(times) // 2]
+            early = [t for t in trades if t.entry_time < mid]
+            late = [t for t in trades if t.entry_time >= mid]
+            es, ls = pf_stats(early), pf_stats(late)
+            print(f"{label + '_' + candidate.upper():<20} {ch:>5.1f} {es['trades']:>8} {es['pf']:>9.3f} {ls['trades']:>8} {ls['pf']:>9.3f}")
     print("=" * 110)
     print("Reference (memory, same per-pair-independent methodology): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320\n")
 
