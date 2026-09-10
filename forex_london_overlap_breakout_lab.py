@@ -91,11 +91,15 @@ a real edge.
 UPDATE 2026-09-10 (fourth): added a TRAILING EXIT sweep via
 `simulate_pair_trailing()`/`_resolve_trade_trailing()` - a chandelier
 stop (no fixed target) trailing peak-since-entry by `chandelier_mult`*ATR,
-per the user's "try the trailing exit instead." A genuinely different
-mechanism from a wider fixed target (can bank a small profit quickly on
-a choppy trade, or ride a real trend as far as it goes), tested on the
-same four single-window candidates. See the printed "TRAILING EXIT
-SWEEP" section for results.
+per the user's "try the trailing exit instead." UPDATE: this is the
+first genuine pass in the whole arc - LONDON_RELVOL@CH=3.0 clears both
+walk-forward halves (pooled 1.157, early 1.224, late 1.093).
+
+UPDATE 2026-09-10 (fifth): added a PER-PAIR BREAKDOWN of the LONDON
+trailing candidates (user: "run the per-pair check next") - does the
+pooled pass hold up pair-by-pair, or is 1-2 pairs carrying it? Also
+trimmed RR_SWEEP to [2.0, 6.0] this run since the full R:R sweep is
+already recorded and was slow.
 
 Run (needs OANDA_API_KEY):
     python forex_london_overlap_breakout_lab.py
@@ -131,7 +135,12 @@ PCTL_THRESH = 0.20
 # starting 21:00 UTC: [21:00, 01:00, 05:00, 09:00, 13:00, 17:00]
 OR_WINDOWS = [("LONDON", 3, 4), ("OVERLAP", 4, 5)]
 CANDIDATE_TYPES = ["relvol", "range_top20", "relvol_and_range"]
-RR_SWEEP = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0]  # stop fixed at ATR*2.0; only the target multiple varies
+# RR_SWEEP trimmed to [2.0, 6.0] for the 2026-09-10 per-pair-check run - the full
+# 7-point sweep is already recorded (pooled PF climbs to 1.26 at RR=6 but it's an
+# early-half-only illusion that fails walk-forward). Keeping RR=2 (baseline) and
+# RR=6 here just as a one-line reminder of that failure mode alongside the trailing
+# results, without paying the full sweep's ~2.5min runtime again.
+RR_SWEEP = [2.0, 6.0]
 CHANDELIER_SWEEP = [2.0, 3.0, 4.0, 5.0]  # trailing distance (x ATR from peak); 3.0 matches the live-bot-family default
 
 
@@ -624,6 +633,45 @@ def main():
             print(f"{label + '_' + candidate.upper():<20} {ch:>5.1f} {es['trades']:>8} {es['pf']:>9.3f} {ls['trades']:>8} {ls['pf']:>9.3f}")
     print("=" * 110)
     print("Reference (memory, same per-pair-independent methodology): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320\n")
+
+    # -----------------------------------------------------------------
+    # TRAILING EXIT - PER-PAIR BREAKDOWN (2026-09-10, user follow-up:
+    # "run the per-pair check next"). The pooled trailing result -
+    # especially LONDON_RELVOL@CH=3.0 (pooled 1.157, early 1.224, late
+    # 1.093) - is the first walk-forward pass in this whole research arc.
+    # Real question: does it hold across the 9 pairs individually, or is
+    # 1-2 pairs carrying the pooled number? Uses the already-computed
+    # trade lists in trail_results (each Trade carries its .pair), so no
+    # extra simulation - just filter + re-score per pair, with each
+    # pair's own trade-time median as its early/late split.
+    # -----------------------------------------------------------------
+    print("\n" + "=" * 110)
+    print("TRAILING EXIT - PER-PAIR BREAKDOWN of the LONDON candidates (does the pooled pass hold up pair-by-pair?)")
+    print("=" * 110)
+    for label, candidate in [("LONDON", "relvol"), ("LONDON", "range_top20")]:
+        for ch in CHANDELIER_SWEEP:
+            all_trades = trail_results[(label, candidate, ch)]
+            print(f"\n{label}_{candidate.upper()}  CH={ch:.1f}   (pooled: {pf_stats(all_trades)['trades']} trades, "
+                  f"PF {pf_stats(all_trades)['pf']:.3f})")
+            print(f"  {'pair':<10} {'trades':>7} {'PF':>8} {'earlyPF':>9} {'latePF':>9}   both halves >1.0?")
+            n_pass = 0
+            for pair in PAIRS:
+                pt = [t for t in all_trades if t.pair == pair]
+                s = pf_stats(pt)
+                if len(pt) < 10:
+                    print(f"  {pair:<10} {s['trades']:>7}  (too few to split)")
+                    continue
+                times = sorted(t.entry_time for t in pt)
+                mid = times[len(times) // 2]
+                e = pf_stats([t for t in pt if t.entry_time < mid])
+                l = pf_stats([t for t in pt if t.entry_time >= mid])
+                ok = (e["pf"] > 1.0 and l["pf"] > 1.0)
+                n_pass += ok
+                print(f"  {pair:<10} {s['trades']:>7} {s['pf']:>8.3f} {e['pf']:>9.3f} {l['pf']:>9.3f}   {'YES' if ok else 'no'}")
+            print(f"  -> {n_pass}/9 pairs pass both walk-forward halves individually")
+    print("=" * 110)
+    print("Reference (memory): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320. "
+          "1% risk/trade, per-pair independent equity, NO spread/slippage modeled.\n")
 
 
 if __name__ == "__main__":
