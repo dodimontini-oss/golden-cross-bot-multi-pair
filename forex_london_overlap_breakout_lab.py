@@ -72,7 +72,19 @@ later bar) has closed. This is a genuinely different idea from
 relvol_and_range: LONDON and OVERLAP are different bars four hours apart
 (not one bar's two correlated stats), so this cross-window agreement
 could plausibly narrow down to a cleaner subset even though the
-same-window confluence didn't.
+same-window confluence didn't. UPDATE: this ALSO failed - CROSS_RELVOL
+(PF 0.827) was the worst result of the whole line of research, and
+CROSS_RANGE_TOP20 (PF 0.963) stayed net negative. Three different
+selectivity variations (single-signal, same-window AND, cross-window
+AND) all landed in the same 0.83-1.03 PF band - strong evidence the
+bottleneck is the fixed 2:1 exit structure, not insufficient selectivity.
+
+UPDATE 2026-09-10 (third): added an R:R SWEEP (`RR_SWEEP`, stop fixed at
+ATR*2.0, only the target multiple varies) on the four single-window
+candidates, since selectivity was now ruled out as the lever to pull.
+See the printed "R:R SWEEP" section for results - this is the first test
+in this line of research where the STOP/TARGET STRUCTURE itself changes
+rather than which days get selected.
 
 Run (needs OANDA_API_KEY):
     python forex_london_overlap_breakout_lab.py
@@ -108,6 +120,7 @@ PCTL_THRESH = 0.20
 # starting 21:00 UTC: [21:00, 01:00, 05:00, 09:00, 13:00, 17:00]
 OR_WINDOWS = [("LONDON", 3, 4), ("OVERLAP", 4, 5)]
 CANDIDATE_TYPES = ["relvol", "range_top20", "relvol_and_range"]
+RR_SWEEP = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0]  # stop fixed at ATR*2.0; only the target multiple varies
 
 
 def get_candles_range(instrument: str, from_time: str) -> pd.DataFrame:
@@ -198,10 +211,15 @@ class Trade:
         self.direction, self.entry_time, self.exit_time, self.r_multiple = direction, entry_time, exit_time, r_multiple
 
 
-def _resolve_trade(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: int):
+def _resolve_trade(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: int, rr_ratio: float = RR_RATIO):
     """Shared exit-scanning logic: enter at h4.iloc[entry_idx]'s open, ATR
     taken from the just-closed prior bar, scan forward from the entry bar
-    itself (same-day-resolution fix) for the first stop/target hit.
+    itself (same-day-resolution fix) for the first stop/target hit. Stop
+    distance is always ATR_STOP_MULT*ATR (unchanged); `rr_ratio` sets how
+    many multiples of that stop distance the target sits at - this is the
+    knob the 2026-09-10 R:R sweep varies, keeping the stop fixed and
+    widening ONLY the target, per the user's request ("wider target
+    instead of 2:1" - not a wider stop).
     Returns (r_outcome, entry_price, exit_idx) or None if untradeable
     (ATR not yet warmed up)."""
     entry_bar = h4.iloc[entry_idx]
@@ -211,9 +229,9 @@ def _resolve_trade(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: 
         return None
     stop_dist = ATR_STOP_MULT * a
     if direction == 1:
-        stop_price, target_price = entry_price - stop_dist, entry_price + RR_RATIO * stop_dist
+        stop_price, target_price = entry_price - stop_dist, entry_price + rr_ratio * stop_dist
     else:
-        stop_price, target_price = entry_price + stop_dist, entry_price - RR_RATIO * stop_dist
+        stop_price, target_price = entry_price + stop_dist, entry_price - rr_ratio * stop_dist
 
     for j in range(entry_idx, len(h4)):
         bar = h4.iloc[j]
@@ -222,14 +240,14 @@ def _resolve_trade(h4: pd.DataFrame, atr: pd.Series, entry_idx: int, direction: 
         if hit_stop:  # dual-hit -> conservative: stop wins
             return -1.0, entry_price, j
         if hit_target:
-            return RR_RATIO, entry_price, j
+            return rr_ratio, entry_price, j
 
     last = h4.iloc[-1]
     move = (last["close"] - entry_price) if direction == 1 else (entry_price - last["close"])
     return move / stop_dist, entry_price, len(h4) - 1
 
 
-def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str):
+def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, candidate: str, rr_ratio: float = RR_RATIO):
     flag_col = f"{label}_{candidate}"
     dir_col = f"{label}_dir"
     entry_idx_col = f"{label}_entry_bar_idx"
@@ -249,7 +267,7 @@ def simulate_pair(pair: str, h4: pd.DataFrame, daily: pd.DataFrame, label: str, 
         entry_idx = int(day[entry_idx_col])
         if entry_idx <= blocked_until_idx or entry_idx >= len(h4):
             continue
-        result = _resolve_trade(h4, atr, entry_idx, direction)
+        result = _resolve_trade(h4, atr, entry_idx, direction, rr_ratio)
         if result is None:
             continue
         r_outcome, entry_price, exit_idx = result
@@ -399,6 +417,61 @@ def main():
             s = pf_stats(pair_trades)
             print(f"  {pair:<10} trades={s['trades']:>4}  win%={s['win_rate']:>5.1f}  PF={s['pf']:>6.3f}")
     print("=" * 110 + "\n")
+
+    # -----------------------------------------------------------------
+    # R:R SWEEP (2026-09-10, user follow-up): every result above used a
+    # fixed 2:1 target (RR_RATIO=2.0, i.e. target = 4x ATR against a 2x
+    # ATR stop) inherited from the live bot's own risk framework. Stop
+    # distance stays fixed at ATR*2.0 throughout this sweep - only the
+    # TARGET multiple varies - testing whether a wider (or narrower)
+    # target changes the picture for the two single-window candidates
+    # that came closest to breakeven (LONDON_RELVOL, LONDON_RANGE_TOP20)
+    # plus the two OVERLAP equivalents for contrast. Skips the
+    # relvol_and_range/CROSS variants - they were strictly worse than
+    # their single-signal counterparts at RR=2.0, no reason to re-sweep them.
+    # -----------------------------------------------------------------
+    print("\n" + "=" * 110)
+    print("R:R SWEEP - stop fixed at ATR*2.0, target multiple varies (2.0 = the baseline used everywhere above)")
+    print("=" * 110)
+    sweep_candidates = [("LONDON", "relvol"), ("LONDON", "range_top20"), ("OVERLAP", "relvol"), ("OVERLAP", "range_top20")]
+    print(f"{'Candidate':<20} " + " ".join(f"RR={rr:<4.1f}" for rr in RR_SWEEP))
+    print("-" * 110)
+    sweep_results = {}
+    for label, candidate in sweep_candidates:
+        row_pf, row_trades = [], []
+        for rr in RR_SWEEP:
+            pooled_trades = []
+            for pair in PAIRS:
+                trades, _ = simulate_pair(pair, per_pair_h4[pair], per_pair_daily[pair], label, candidate, rr_ratio=rr)
+                pooled_trades.extend(trades)
+            stats = pf_stats(pooled_trades)
+            sweep_results[(label, candidate, rr)] = pooled_trades
+            row_pf.append(stats["pf"])
+            row_trades.append(stats["trades"])
+        name = f"{label}_{candidate.upper()}"
+        print(f"{name:<20} " + " ".join(f"{pf:6.3f}" for pf in row_pf))
+        print(f"{'  (n trades)':<20} " + " ".join(f"{n:6d}" for n in row_trades))
+    print("=" * 110)
+
+    print("\n" + "=" * 110)
+    print("R:R SWEEP - WALK-FORWARD CHECK on every cell above (early/late PF)")
+    print("=" * 110)
+    print(f"{'Candidate':<20} {'RR':>5} {'EarlyTr':>8} {'EarlyPF':>9} {'LateTr':>8} {'LatePF':>9}")
+    print("-" * 110)
+    for label, candidate in sweep_candidates:
+        for rr in RR_SWEEP:
+            trades = sweep_results[(label, candidate, rr)]
+            if len(trades) < 10:
+                print(f"{label}_{candidate.upper():<12} {rr:>5.1f}  SKIP - too few trades ({len(trades)})")
+                continue
+            times = sorted(t.entry_time for t in trades)
+            mid = times[len(times) // 2]
+            early = [t for t in trades if t.entry_time < mid]
+            late = [t for t in trades if t.entry_time >= mid]
+            es, ls = pf_stats(early), pf_stats(late)
+            print(f"{label + '_' + candidate.upper():<20} {rr:>5.1f} {es['trades']:>8} {es['pf']:>9.3f} {ls['trades']:>8} {ls['pf']:>9.3f}")
+    print("=" * 110)
+    print("Reference (memory, same per-pair-independent methodology): BASELINE PF 1.232, WINNERS (GAPCONFIRM+CURCAP) PF 1.320\n")
 
 
 if __name__ == "__main__":
