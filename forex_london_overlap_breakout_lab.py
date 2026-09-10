@@ -49,6 +49,18 @@ METHODOLOGY NOTES (read before trusting the numbers):
     backtest lab this project has built: exit-scanning starts AT the entry
     bar itself, not the bar after it.
 
+UPDATE 2026-09-10: the single-signal (RELVOL alone, or RANGE_TOP20 alone)
+version of this backtest came back a clean negative (PF 0.93-1.03, worse
+than the live bot's own 1.232/1.320, failing walk-forward on 3 of 4
+candidates) - see project_forex_london_overlap_breakout_backtest.md. The
+diagnosed reason: RELVOL/RANGE alone fire on 7-22% of ALL days, a much
+broader and less special population than the ~13% "big-move days"
+population the 82-83% directional accuracy was actually measured on.
+Added a THIRD candidate type, "relvol_and_range" (require both signals on
+the SAME window simultaneously) to test whether that confluence narrows
+the trigger down closer to the real big-move-day population, the same way
+ORB's RELVOL+GAP confluence beat RELVOL alone on QQQ.
+
 Run (needs OANDA_API_KEY):
     python forex_london_overlap_breakout_lab.py
 """
@@ -82,7 +94,7 @@ PCTL_THRESH = 0.20
 # (label, signal-bar-index-within-day, entry-bar-index) - day = 6 H4 bars
 # starting 21:00 UTC: [21:00, 01:00, 05:00, 09:00, 13:00, 17:00]
 OR_WINDOWS = [("LONDON", 3, 4), ("OVERLAP", 4, 5)]
-CANDIDATE_TYPES = ["relvol", "range_top20"]
+CANDIDATE_TYPES = ["relvol", "range_top20", "relvol_and_range"]
 
 
 def get_candles_range(instrument: str, from_time: str) -> pd.DataFrame:
@@ -154,6 +166,14 @@ def add_day_flags(daily: pd.DataFrame) -> pd.DataFrame:
         range_pctl = daily[f"{label}_range_pct"].rolling(PCTL_LOOKBACK).apply(
             lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
         daily[f"{label}_range_top20"] = range_pctl >= (1 - PCTL_THRESH)
+        # CONFLUENCE: require both signals at once - a narrower, more selective
+        # trigger than either alone, testing whether it filters down to a
+        # subset closer to the actual big-move-day population (the population
+        # the 82-83% directional accuracy in forex_opening_range_lab.py was
+        # actually measured on), rather than the much broader "RELVOL OR
+        # RANGE elevated on an otherwise ordinary day" population that the
+        # single-signal version in this script traded unconditionally.
+        daily[f"{label}_relvol_and_range"] = daily[f"{label}_relvol"] & daily[f"{label}_range_top20"]
     return daily
 
 
