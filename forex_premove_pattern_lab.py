@@ -120,13 +120,24 @@ def build_features(df: pd.DataFrame, instrument: str) -> pd.DataFrame:
 
     # Weekend gap: flag only the FIRST H4 bar after a gap of > 24h since the previous bar
     # (i.e. the Sunday/Monday reopen after Friday's close) - everywhere else this is False.
+    # Reopens are sparse (~1 per ~30 H4 bars/week), so the percentile is computed over the
+    # trailing N REOPEN occurrences specifically, not the trailing N raw bars - a plain
+    # PCTL_LOOKBACK-bar window would contain only ~2 actual reopens and never reach
+    # min_periods, which is exactly what happened before this fix (WEEKEND_GAP_TOP20 came
+    # back "n/a" - zero valid flags - on the first run).
     hours_since_prev = d["time"].diff().dt.total_seconds() / 3600
     is_reopen = hours_since_prev > 24
     prev_close_before_gap = d["close"].shift(1)
-    gap_pct = ((d["open"] - prev_close_before_gap).abs() / prev_close_before_gap * 100).where(is_reopen)
-    gap_pctl = gap_pct.rolling(PCTL_LOOKBACK, min_periods=10).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
-    d["weekend_gap_top20"] = is_reopen & (gap_pctl >= (1 - PCTL_THRESH)).fillna(False)
+    gap_pct = (d["open"] - prev_close_before_gap).abs() / prev_close_before_gap * 100
+
+    d["weekend_gap_top20"] = False
+    reopen_idx = d.index[is_reopen]
+    if len(reopen_idx) >= 10:
+        reopen_gap_vals = gap_pct.loc[reopen_idx].reset_index(drop=True)
+        reopen_pctl = reopen_gap_vals.rolling(20, min_periods=10).apply(
+            lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
+        reopen_flag = (reopen_pctl >= (1 - PCTL_THRESH)).fillna(False)
+        d.loc[reopen_idx, "weekend_gap_top20"] = reopen_flag.values
 
     return d
 
@@ -232,31 +243,24 @@ def main():
 
     # ---------------------------------------------------------------------
     # FOLLOW-UP: directional information, same check as the QQQ study - does
-    # clustering (or any survivor) predict WHICH WAY, not just THAT a big
-    # move is coming?
+    # PRIOR_BIG_1 (the candidate that actually survived here - NOT
+    # PRIOR_BIG_1-3, which failed on magnitude above) predict WHICH WAY,
+    # not just THAT a big move is coming?
     # ---------------------------------------------------------------------
     print("=" * 115)
-    print("FOLLOW-UP - does PRIOR_BIG_1-3 (if it survived) carry directional information?")
+    print("FOLLOW-UP - does PRIOR_BIG_1 (the actual survivor above) carry directional information?")
     print("=" * 115)
-
-    def most_recent_big_dir(dframe, idx):
-        for lag in (1, 2, 3):
-            j = idx - lag
-            if j < 0:
-                continue
-            if dframe["big_move"].iloc[j]:
-                return 1 if dframe["ret"].iloc[j] > 0 else -1
-        return None
 
     rows = []
     for pair, df in per_pair.items():
         dd = df.iloc[warmup:].reset_index(drop=True)
         for i in range(len(dd)):
-            if not dd["big_move"].iloc[i] or not dd["prior_big_1_3"].iloc[i]:
+            if not dd["big_move"].iloc[i] or not dd["prior_big_1"].iloc[i]:
                 continue
-            prior_dir = most_recent_big_dir(dd, i)
-            if prior_dir is None:
-                continue
+            j = i - 1
+            if j < 0 or not dd["big_move"].iloc[j]:
+                continue  # prior_big_1 true but the actual prior bar isn't available/flagged - skip
+            prior_dir = 1 if dd["ret"].iloc[j] > 0 else -1
             this_dir = 1 if dd["ret"].iloc[i] > 0 else -1
             rows.append({"time": dd["time"].iloc[i], "continuation": this_dir == prior_dir})
     clust = pd.DataFrame(rows)
