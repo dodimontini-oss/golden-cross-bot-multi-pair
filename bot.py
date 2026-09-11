@@ -73,6 +73,16 @@ CONFIRM_MIN_GAP_ATR = 0.10
 CONFIRM_MAX_BARS = 5
 MAX_CURRENCY_RISK_PCT = 2.5
 
+# Feature flag for the trailing-stop update stub (see the section near the
+# bottom of this file). Defaults OFF - unset/anything but "true" leaves
+# update_trailing_stops() uncalled, matching the file's behavior before
+# this flag existed. Flipping it on is ALSO still a no-op on its own: the
+# function only acts on trades tagged by place_trailing_order(), and
+# nothing calls that yet (no strategy currently enters a trailing-managed
+# trade). Real live effect requires both this flag AND a caller of
+# place_trailing_order() to exist - deliberately two separate switches.
+ENABLE_TRAILING_STOPS = os.getenv("ENABLE_TRAILING_STOPS", "false").strip().lower() == "true"
+
 # Validated shortlist from the 23-pair screen - profit factor > 1.15 and
 # controlled drawdown over the full 2015-2026 backtest.
 PAIRS = [
@@ -387,6 +397,8 @@ def check_all_pairs():
                 log.warning("[%s] Not enough candle history yet (%d bars).", instrument, len(df))
                 continue
             check_and_trade(instrument, df, balance, account_ccy, risk_by_ccy)
+            if ENABLE_TRAILING_STOPS:
+                update_trailing_stops(instrument, df)
         except Exception:
             errors.append(instrument)
             log.exception("[%s] Error during check - skipping this pair this cycle.", instrument)
@@ -396,13 +408,17 @@ def check_all_pairs():
 
 # ---------------- Trailing-stop update logic (STUB, 2026-09-10) ----------------
 #
-# NOT wired into check_all_pairs() and not called from anywhere yet. Every
-# live trade today is opened by place_order() as a golden-cross GAPCONFIRM+
-# CURCAP fixed 2:1 bracket - this section must never touch those. A trade
-# is only visible to this code if it was opened by place_trailing_order()
-# below, tagged "xr_<distance>" in clientExtensions - nothing currently
-# calls place_trailing_order() either, so get_open_trailing_trades() will
-# always return [] and update_trailing_stops() is a true no-op today.
+# Called from check_all_pairs() (see below) but ONLY when the
+# ENABLE_TRAILING_STOPS env var is "true" - unset/default, this whole
+# section still never runs, same as before that wiring existed. Even with
+# the flag on, it stays a no-op in practice today: every live trade is
+# opened by place_order() as a golden-cross GAPCONFIRM+CURCAP fixed 2:1
+# bracket, and this code only ever acts on a trade tagged "xr_<distance>"
+# by place_trailing_order() - nothing calls that yet, so
+# get_open_trailing_trades() returns [] regardless of the flag. Two
+# separate switches (the flag, and an actual caller of
+# place_trailing_order()) both have to be true before this touches a real
+# position - deliberately not one.
 #
 # Built for a possible future CROSS_RANGE_TOP20 deployment (see
 # project_forex_london_overlap_breakout_backtest.md's "Portfolio B" -
@@ -505,9 +521,9 @@ def update_trailing_stop(trade: dict, new_stop: float, decimals: int) -> dict:
 
 
 def update_trailing_stops(instrument: str, df: pd.DataFrame):
-    """Per-instrument driver. NOT currently called from check_all_pairs()
-    or anywhere else - see the module-level note above for why, and what
-    would need to change before this does anything live.
+    """Per-instrument driver, called from check_all_pairs() behind the
+    ENABLE_TRAILING_STOPS flag - see the module-level note above for why
+    it's still a no-op in practice even when that flag is on.
 
     For each open trailing-managed trade on this instrument: recompute the
     peak price since entry from candle history, derive the new chandelier
