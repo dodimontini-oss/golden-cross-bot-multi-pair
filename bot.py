@@ -90,6 +90,23 @@ PAIRS = [
     "USD_CHF", "EUR_USD", "EUR_AUD", "AUD_NZD",
 ]
 
+# CROSS_RANGE_TOP20 ("Portfolio B") - see project_forex_london_overlap_
+# breakout_backtest.md. Only these 3 of the 9 PAIRS above were validated -
+# running this signal on any other pair would be untested. CURCAP-aware
+# backtest: PF 1.847, +181.6% shared-equity, thirds-split robust.
+CROSS_RANGE_PAIRS = ["GBP_JPY", "GBP_AUD", "GBP_CHF"]
+CROSS_RANGE_CHANDELIER_MULT = 4.0
+CROSS_RANGE_PCTL_LOOKBACK = 60
+CROSS_RANGE_PCTL_THRESH = 0.20
+# Defaults OFF, same two-switch philosophy as ENABLE_TRAILING_STOPS. This
+# one has a hard dependency the other didn't: a trade opened here is
+# managed ENTIRELY by trailing (no take-profit at all, see
+# place_trailing_order) - if ENABLE_TRAILING_STOPS is off, that trade would
+# sit with only its ORIGINAL entry-time stop forever, which is a
+# materially different, never-backtested risk profile. check_and_trade_
+# cross_range() refuses to trade rather than silently allow that.
+ENABLE_CROSS_RANGE_TOP20 = os.getenv("ENABLE_CROSS_RANGE_TOP20", "false").strip().lower() == "true"
+
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type": "application/json",
@@ -399,6 +416,8 @@ def check_all_pairs():
             check_and_trade(instrument, df, balance, account_ccy, risk_by_ccy)
             if ENABLE_TRAILING_STOPS:
                 update_trailing_stops(instrument, df)
+            if ENABLE_CROSS_RANGE_TOP20 and instrument in CROSS_RANGE_PAIRS:
+                check_and_trade_cross_range(instrument, balance, account_ccy, risk_by_ccy)
         except Exception:
             errors.append(instrument)
             log.exception("[%s] Error during check - skipping this pair this cycle.", instrument)
@@ -535,11 +554,18 @@ def update_trailing_stops(instrument: str, df: pd.DataFrame):
     if not trades:
         return
     decimals = price_decimals(instrument)
+    # BUGFIX 2026-09-10: get_recent_candles()/_candles_to_df() stores "time"
+    # as OANDA's raw string, not a Timestamp (unlike get_daily_candles_with_
+    # volume() below) - comparing that column directly against a Timestamp
+    # raises a TypeError. Parse once here rather than changing the shared
+    # _candles_to_df(), which check_and_trade()'s own signal path depends on
+    # exactly as-is.
+    times = pd.to_datetime(df["time"])
     for trade in trades:
         direction = "LONG" if float(trade["currentUnits"]) > 0 else "SHORT"
         entry_time = pd.Timestamp(trade["openTime"])
         distance = trailing_distance_from_trade(trade)
-        since_entry = df[df["time"] >= entry_time]
+        since_entry = df[times >= entry_time]
         if since_entry.empty:
             continue  # candle history doesn't reach back to entry this run - try again next cycle
         peak = since_entry["high"].max() if direction == "LONG" else since_entry["low"].min()
@@ -553,6 +579,209 @@ def update_trailing_stops(instrument: str, df: pd.DataFrame):
         log.info("[%s] Trailing stop update: trade %s %s stop %s -> %.5f (peak=%.5f, distance=%.5f)",
                   instrument, trade["id"], direction, current_stop, new_stop, peak, distance)
         update_trailing_stop(trade, new_stop, decimals)
+
+
+# ---------------- CROSS_RANGE_TOP20 entry logic (2026-09-10) ----------------
+#
+# Called from check_all_pairs() only for instruments in CROSS_RANGE_PAIRS,
+# and only when ENABLE_CROSS_RANGE_TOP20 is "true" (default: off, so this
+# whole section is currently unreachable from the live schedule). See
+# project_forex_london_overlap_breakout_backtest.md's "Portfolio B" for
+# the validated backtest this reproduces.
+#
+# Signal: require the LONDON (09:00-13:00 UTC) AND OVERLAP (13:00-17:00
+# UTC) H4 bars to BOTH be in the top 20th percentile of their own trailing
+# 60-day range distribution AND agree on direction. Enter at the OPEN of
+# the bar after OVERLAP (17:00 UTC), managed by a chandelier trail whose
+# DISTANCE is a single ATR snapshot taken at the OVERLAP bar - fixed for
+# the life of the trade, exactly like _resolve_trade_trailing() in
+# forex_london_overlap_breakout_lab.py.
+#
+# Self-contained (day-grouping/percentile logic reimplemented here rather
+# than imported from that lab script) so this file stays independently
+# correct even if that research script changes or is removed later -
+# matches how this file already reimplements its own sma/atr rather than
+# importing lab scripts.
+#
+# LIVE-DETECTION DIFFERENCE FROM THE BACKTEST, read before trusting this:
+# the backtest's rolling percentile is computed over a window that
+# INCLUDES the day being tested (fine offline, where every bar already
+# exists). Live, "today" is only partially formed when this needs to
+# decide - so the percentile baseline here is the trailing
+# CROSS_RANGE_PCTL_LOOKBACK PRIOR complete days only, and today's LONDON/
+# OVERLAP ranges are compared against that baseline once OVERLAP itself
+# has closed (not waiting for the entry bar to close too, which would be
+# 4 hours too late). Directionally faithful to the backtest, not a
+# bit-identical replay of it.
+#
+# REAL CURRENCY-EXPOSURE INTERACTION NOT COVERED BY THE BACKTEST: GBP_JPY,
+# GBP_AUD, and GBP_CHF are ALL also in golden-cross's own PAIRS list above.
+# The CURCAP backtest (forex_cross_range_top20_curcap_lab.py) only modeled
+# these 3 pairs' OWN cross-range trades competing for the 2.5% cap - it
+# did NOT account for golden-cross ALSO potentially holding a position on
+# the same pair/currency at the same time. Live, get_open_trades_risk_by_
+# currency() correctly sees BOTH strategies' real open risk (it scans
+# every open trade on the account, not just one strategy's), so the cap
+# IS enforced correctly here - but this means live CROSS_RANGE_TOP20
+# entries will likely be blocked MORE often than the isolated backtest
+# predicted, whenever golden-cross already holds a GBP-cross position.
+# That's the cap doing its job, not a bug - just a real difference from
+# an assumption the backtest never checked.
+
+def get_daily_candles_with_volume(instrument: str, count: int) -> pd.DataFrame:
+    """Same OANDA H4 fetch as get_recent_candles(), but parses time to a
+    real Timestamp (get_recent_candles() keeps it as OANDA's raw string) -
+    needed by find_cross_range_signal() below. Kept separate so golden-
+    cross's own signal path (get_recent_candles/_candles_to_df) is
+    untouched."""
+    url = f"{OANDA_BASE_URL}/v3/instruments/{instrument}/candles"
+    params = {"count": count, "granularity": GRANULARITY, "price": "M"}
+    resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+    resp.raise_for_status()
+    rows = [
+        {"time": pd.Timestamp(c["time"]), "open": float(c["mid"]["o"]), "high": float(c["mid"]["h"]),
+         "low": float(c["mid"]["l"]), "close": float(c["mid"]["c"])}
+        for c in resp.json()["candles"] if c["complete"]
+    ]
+    return pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+
+
+def find_cross_range_signal(h4: pd.DataFrame):
+    """Returns (direction, atr_at_signal, signal_time) if today's
+    CROSS_RANGE_TOP20 signal is live and still actionable, else None.
+    signal_time is the OVERLAP bar's own timestamp - a stable value tied to
+    the signal itself (not "now"), used by the caller to build a
+    deterministic client_order_id so repeated polls within the same
+    ~4-hour entry window (before the 17:00 UTC bar closes and this day
+    ages out of "today_so_far" below) don't place duplicate orders. See
+    the module note above for the live-vs-backtest percentile difference.
+
+    Note "today_so_far" can only ever hold 0-5 bars, never 6: the instant
+    a 6th bar would complete it, integer division folds it into
+    n_complete_days and today_so_far resets to 0 for the next day - so
+    there's no separate "entry bar also closed" state to detect here; it
+    resolves on its own as "too early for the next day" one bar later.
+    """
+    first_idx = h4.index[h4["time"].dt.hour == 21]
+    if len(first_idx) == 0:
+        return None
+    offset = first_idx[0]
+    d = h4.iloc[offset:].reset_index(drop=True)
+    n_complete_days = len(d) // 6
+    complete = d.iloc[: n_complete_days * 6]
+    today_so_far = d.iloc[n_complete_days * 6:]  # 0-5 bars of the still-forming trading day
+
+    if len(today_so_far) != 5:
+        return None  # OVERLAP bar (index 4) hasn't closed yet, or today has already moved on
+
+    london_bar, overlap_bar = today_so_far.iloc[3], today_so_far.iloc[4]
+    today_london_range = (london_bar["high"] - london_bar["low"]) / london_bar["open"] * 100
+    today_overlap_range = (overlap_bar["high"] - overlap_bar["low"]) / overlap_bar["open"] * 100
+    london_dir = 1 if london_bar["close"] > london_bar["open"] else (-1 if london_bar["close"] < london_bar["open"] else 0)
+    overlap_dir = 1 if overlap_bar["close"] > overlap_bar["open"] else (-1 if overlap_bar["close"] < overlap_bar["open"] else 0)
+    if london_dir == 0 or london_dir != overlap_dir:
+        return None
+
+    if n_complete_days < CROSS_RANGE_PCTL_LOOKBACK:
+        return None  # not enough history yet to trust the percentile baseline
+    hist = []
+    for i in range(n_complete_days):
+        chunk = complete.iloc[i * 6: i * 6 + 6]
+        hist.append({
+            "LONDON": (chunk.iloc[3]["high"] - chunk.iloc[3]["low"]) / chunk.iloc[3]["open"] * 100,
+            "OVERLAP": (chunk.iloc[4]["high"] - chunk.iloc[4]["low"]) / chunk.iloc[4]["open"] * 100,
+        })
+    hist_df = pd.DataFrame(hist).iloc[-CROSS_RANGE_PCTL_LOOKBACK:]
+
+    def in_top20(value, baseline):
+        return (baseline < value).mean() >= (1 - CROSS_RANGE_PCTL_THRESH)
+
+    if not (in_top20(today_london_range, hist_df["LONDON"]) and in_top20(today_overlap_range, hist_df["OVERLAP"])):
+        return None
+
+    atr_series = atr_wilder(h4, ATR_LEN)
+    signal_bar_idx = offset + n_complete_days * 6 + 4  # OVERLAP bar's index in the full h4 frame
+    atr_at_signal = atr_series.iloc[signal_bar_idx]
+    if pd.isna(atr_at_signal) or atr_at_signal <= 0:
+        return None
+    return ("LONG" if overlap_dir == 1 else "SHORT"), atr_at_signal, overlap_bar["time"]
+
+
+def check_and_trade_cross_range(instrument: str, balance: float, account_ccy: str, risk_by_ccy: dict):
+    """CROSS_RANGE_TOP20 entry check for one pair - mirrors check_and_trade()'s
+    structure (CURCAP, already-in-position, sizing) for a different signal
+    and a trailing (not fixed-bracket) exit."""
+    if ENABLE_CROSS_RANGE_TOP20 and not ENABLE_TRAILING_STOPS:
+        raise RuntimeError(
+            "ENABLE_CROSS_RANGE_TOP20 is on but ENABLE_TRAILING_STOPS is off - a trade opened here would "
+            "never get its stop trailed (only its original entry-time stop, no take-profit at all), which "
+            "is a materially different and never-backtested risk profile. Refusing to trade."
+        )
+
+    df = get_daily_candles_with_volume(instrument, count=(CROSS_RANGE_PCTL_LOOKBACK + 5) * 6)
+    signal = find_cross_range_signal(df)
+    if signal is None:
+        log.info("[%s] No fresh CROSS_RANGE_TOP20 signal. No action.", instrument)
+        return
+    direction, atr_at_signal, signal_time = signal
+
+    position = get_open_position_units(instrument)
+    if position != 0:
+        log.info("[%s] Already in a position (%s units) - CROSS_RANGE_TOP20 signal skipped.", instrument, position)
+        return
+
+    # Same anti-duplicate pattern check_and_trade() uses: the position check
+    # above only catches a STILL-OPEN trade from an earlier poll this same
+    # ~4-hour window - if that trade already opened AND closed (e.g.
+    # stopped out fast) before this poll, position would read 0 again and
+    # the signal above would still look fresh, which could otherwise
+    # re-enter a signal the backtest only ever takes once.
+    history = requests.get(f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades",
+        headers=HEADERS, params={"instrument": instrument, "state": "ALL", "count": 500}, timeout=15)
+    history.raise_for_status()
+    if any(pd.Timestamp(t["openTime"]) >= pd.Timestamp(signal_time) for t in history.json()["trades"]):
+        return
+
+    base, quote = currency_legs(instrument)
+    risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
+    cap_dollars = balance * (MAX_CURRENCY_RISK_PCT / 100)
+    base_risk = risk_by_ccy.get(base, 0.0)
+    quote_risk = risk_by_ccy.get(quote, 0.0)
+    if base_risk + risk_amount > cap_dollars or quote_risk + risk_amount > cap_dollars:
+        log.info("[%s] CROSS_RANGE_TOP20 %s signal confirmed but blocked by currency exposure cap "
+                  "(%s open risk=%.2f, %s open risk=%.2f, cap=%.2f). No action.",
+                  instrument, direction, base, base_risk, quote, quote_risk, cap_dollars)
+        return
+
+    quote_response = requests.get(f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing",
+        headers=HEADERS, params={"instruments": instrument}, timeout=15)
+    quote_response.raise_for_status()
+    price = quote_response.json()["prices"][0]
+    if not price.get("tradeable", False) or pd.Timestamp.now(tz="UTC") - pd.Timestamp(price["time"]) > pd.Timedelta(minutes=1):
+        raise RuntimeError("Non-tradeable or stale forex quote")
+    latest_close = safety.positive(price["asks" if direction == "LONG" else "bids"][0]["price"])
+
+    stop_distance = atr_at_signal * ATR_STOP_MULT
+    chandelier_distance = atr_at_signal * CROSS_RANGE_CHANDELIER_MULT
+    quote_to_account = get_conversion_rate(quote, account_ccy)
+    units = int(risk_amount / (stop_distance * quote_to_account))
+    if direction == "LONG":
+        initial_stop = latest_close - stop_distance
+    else:
+        initial_stop = latest_close + stop_distance
+        units = -units
+
+    client_id = safety.signal_id("xr", instrument, signal_time)
+    log.info("[%s] CROSS_RANGE_TOP20 %s signal - placing trailing order: units=%d close=%.5f "
+              "initial_stop=%.5f chandelier_distance=%.5f", instrument, direction, units, latest_close,
+              initial_stop, chandelier_distance)
+    result = place_trailing_order(instrument, units, initial_stop, chandelier_distance, client_id)
+    log.info("[%s] OANDA response: %s", instrument, result)
+    if "orderFillTransaction" not in result:
+        raise RuntimeError("Order did not confirm a fill; reconcile before continuing")
+
+    for ccy in (base, quote):
+        risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + risk_amount
 
 
 # ---------------- Modes ----------------
