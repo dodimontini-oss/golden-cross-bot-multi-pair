@@ -394,6 +394,151 @@ def check_all_pairs():
         raise RuntimeError(f"Incomplete forex cycle: {errors}")
 
 
+# ---------------- Trailing-stop update logic (STUB, 2026-09-10) ----------------
+#
+# NOT wired into check_all_pairs() and not called from anywhere yet. Every
+# live trade today is opened by place_order() as a golden-cross GAPCONFIRM+
+# CURCAP fixed 2:1 bracket - this section must never touch those. A trade
+# is only visible to this code if it was opened by place_trailing_order()
+# below, tagged "xr_<distance>" in clientExtensions - nothing currently
+# calls place_trailing_order() either, so get_open_trailing_trades() will
+# always return [] and update_trailing_stops() is a true no-op today.
+#
+# Built for a possible future CROSS_RANGE_TOP20 deployment (see
+# project_forex_london_overlap_breakout_backtest.md's "Portfolio B" -
+# {GBP_JPY, GBP_AUD, GBP_CHF}, CH=4.0 chandelier trail). That strategy's
+# validated exit is: stop = peak-price-since-entry -/+ chandelier_mult*ATR,
+# where ATR is a SINGLE snapshot taken at entry (not recomputed bar-by-
+# bar) - so the trail DISTANCE is fixed for the life of a trade; only the
+# price it trails from moves. Peak-since-entry is recomputed from candle
+# history each run rather than stored as bot-side state, matching this
+# file's existing pattern for GAPCONFIRM and CURCAP (GitHub Actions runs
+# are stateless containers).
+#
+# SIMPLER ALTERNATIVE, noted rather than silently chosen: since the trail
+# distance never changes over a trade's life, OANDA's native
+# trailingStopLossOnFill order type (broker manages the trail server-side,
+# continuously, not just once per H4 poll) would reproduce the validated
+# backtest with less code and no per-run polling dependency. This poll-
+# and-PATCH version was built because it was asked for directly, and it
+# generalizes to a future strategy whose trail distance needs to change
+# mid-trade (this one's doesn't). If CROSS_RANGE_TOP20 specifically is
+# what ends up deployed, prefer trailingStopLossOnFill over wiring this up.
+
+TRAILING_TAG_PREFIX = "xr"  # "cross-range" - distinguishes trailing-managed trades from golden-cross's own
+
+
+def place_trailing_order(instrument: str, units: int, initial_stop: float, chandelier_distance: float,
+                          client_id=None) -> dict:
+    """Places a market order with an initial fixed stop and NO take-profit
+    (a trailing exit rides the trade rather than capping it). Encodes the
+    chandelier trail DISTANCE in the client_order_id's tag - the same
+    "persist a stop distance in broker-side order metadata" pattern
+    execution.signal_id() already uses elsewhere in this project, since
+    that's the only place this value survives between stateless runs.
+    trailing_distance_from_trade() below decodes it back out."""
+    if units == 0:
+        raise ValueError("Cannot place zero units")
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+    decimals = price_decimals(instrument)
+    tag = f"{TRAILING_TAG_PREFIX}_{format(safety.positive(chandelier_distance), '.10g')}"
+    body = {
+        "order": {
+            "type": "MARKET",
+            "instrument": instrument,
+            "units": str(units),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {"price": f"{initial_stop:.{decimals}f}"},
+        }
+    }
+    if client_id:
+        check = requests.get(url + "/@" + client_id, headers=HEADERS, timeout=15)
+        if check.status_code != 404:
+            check.raise_for_status()
+            return check.json()
+        body["order"]["clientExtensions"] = {"id": client_id, "tag": tag}
+    resp = requests.post(url, headers=HEADERS, json=body, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def trailing_distance_from_trade(trade: dict):
+    """Decodes the chandelier distance a trade was opened with, from its
+    clientExtensions tag (see place_trailing_order). Returns None if this
+    trade wasn't opened by place_trailing_order - callers must treat that
+    as "not a trailing-managed trade, leave it alone" and never guess."""
+    tag = trade.get("clientExtensions", {}).get("tag", "")
+    prefix = TRAILING_TAG_PREFIX + "_"
+    if not tag.startswith(prefix):
+        return None
+    return safety.positive(tag[len(prefix):])
+
+
+def compute_trailing_stop(direction: str, peak_price: float, chandelier_distance: float) -> float:
+    """Same rule as forex_london_overlap_breakout_lab.py's
+    _resolve_trade_trailing(): stop = peak - distance for a long, peak +
+    distance for a short. Caller (update_trailing_stops) is responsible
+    for only ever moving the stop in the favorable direction."""
+    return peak_price - chandelier_distance if direction == "LONG" else peak_price + chandelier_distance
+
+
+def get_open_trailing_trades(instrument: str) -> list:
+    """Open trades on this instrument that were opened by
+    place_trailing_order (identified by the clientExtensions tag) - every
+    golden-cross GAPCONFIRM+CURCAP trade is deliberately invisible here."""
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades"
+    resp = requests.get(url, headers=HEADERS, params={"instrument": instrument, "state": "OPEN"}, timeout=15)
+    resp.raise_for_status()
+    return [t for t in resp.json()["trades"] if trailing_distance_from_trade(t) is not None]
+
+
+def update_trailing_stop(trade: dict, new_stop: float, decimals: int) -> dict:
+    """PUTs a replacement stop-loss price onto an already-open trade via
+    OANDA's dependent-orders endpoint - only touches the protective order
+    attached to the trade, never the position itself."""
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade['id']}/orders"
+    body = {"stopLoss": {"price": f"{new_stop:.{decimals}f}", "timeInForce": "GTC"}}
+    resp = requests.put(url, headers=HEADERS, json=body, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_trailing_stops(instrument: str, df: pd.DataFrame):
+    """Per-instrument driver. NOT currently called from check_all_pairs()
+    or anywhere else - see the module-level note above for why, and what
+    would need to change before this does anything live.
+
+    For each open trailing-managed trade on this instrument: recompute the
+    peak price since entry from candle history, derive the new chandelier
+    stop, and PATCH it ONLY if that's more favorable than the current stop
+    - a trailing stop must never loosen, and this checks explicitly rather
+    than trusting the broker to refuse an unfavorable replacement.
+    """
+    trades = get_open_trailing_trades(instrument)
+    if not trades:
+        return
+    decimals = price_decimals(instrument)
+    for trade in trades:
+        direction = "LONG" if float(trade["currentUnits"]) > 0 else "SHORT"
+        entry_time = pd.Timestamp(trade["openTime"])
+        distance = trailing_distance_from_trade(trade)
+        since_entry = df[df["time"] >= entry_time]
+        if since_entry.empty:
+            continue  # candle history doesn't reach back to entry this run - try again next cycle
+        peak = since_entry["high"].max() if direction == "LONG" else since_entry["low"].min()
+        new_stop = compute_trailing_stop(direction, peak, distance)
+        current_stop = trade.get("stopLossOrder", {}).get("price")
+        if current_stop is not None:
+            current_stop = float(current_stop)
+            more_favorable = new_stop > current_stop if direction == "LONG" else new_stop < current_stop
+            if not more_favorable:
+                continue
+        log.info("[%s] Trailing stop update: trade %s %s stop %s -> %.5f (peak=%.5f, distance=%.5f)",
+                  instrument, trade["id"], direction, current_stop, new_stop, peak, distance)
+        update_trailing_stop(trade, new_stop, decimals)
+
+
 # ---------------- Modes ----------------
 
 def run_once():
