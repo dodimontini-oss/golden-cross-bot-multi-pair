@@ -16,5 +16,5 @@ jobs:
       - run: pip install requests pandas
       - run: python bot.py once
         env:
-          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+          OANDA_API_KEY: ${{ 0d83072b69a0909db195d7dfc1cafb00-903b5da342475fd76ada634d66e1ae71 }}
+          OANDA_ACCOUNT_ID: ${{ 101-001-35932862-001 }}
