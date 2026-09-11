@@ -107,6 +107,21 @@ CROSS_RANGE_PCTL_THRESH = 0.20
 # cross_range() refuses to trade rather than silently allow that.
 ENABLE_CROSS_RANGE_TOP20 = os.getenv("ENABLE_CROSS_RANGE_TOP20", "false").strip().lower() == "true"
 
+# CROSS_RANGE_TOP20 ("Portfolio A") - the SAME signal as Portfolio B above
+# (see find_cross_range_signal()), on a DIFFERENT 3-pair set with a fixed
+# 2:1 bracket instead of a trailing exit - deliberately built and gated as
+# a completely separate flag/pair-list/function from Portfolio B rather
+# than merged with it, so the two can never both fire on GBP_JPY/GBP_AUD
+# (both portfolios include those two) at once - that combination was never
+# backtested and would double real exposure on those pairs. Needs zero new
+# execution code: uses place_order(), the same already-proven function
+# golden-cross itself uses. CURCAP-aware backtest: PF 1.412, +92.0%
+# shared-equity. Recommended (2026-09-10) as the lower-risk of the two
+# portfolios to deploy first, since it has no new execution-code surface -
+# only the signal-detection is new, not the order-placement mechanism.
+CROSS_RANGE_FIXED_PAIRS = ["GBP_JPY", "GBP_AUD", "GBP_CAD"]
+ENABLE_CROSS_RANGE_FIXED = os.getenv("ENABLE_CROSS_RANGE_FIXED", "false").strip().lower() == "true"
+
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type": "application/json",
@@ -418,6 +433,8 @@ def check_all_pairs():
                 update_trailing_stops(instrument, df)
             if ENABLE_CROSS_RANGE_TOP20 and instrument in CROSS_RANGE_PAIRS:
                 check_and_trade_cross_range(instrument, balance, account_ccy, risk_by_ccy)
+            if ENABLE_CROSS_RANGE_FIXED and instrument in CROSS_RANGE_FIXED_PAIRS:
+                check_and_trade_cross_range_fixed(instrument, balance, account_ccy, risk_by_ccy)
         except Exception:
             errors.append(instrument)
             log.exception("[%s] Error during check - skipping this pair this cycle.", instrument)
@@ -776,6 +793,74 @@ def check_and_trade_cross_range(instrument: str, balance: float, account_ccy: st
               "initial_stop=%.5f chandelier_distance=%.5f", instrument, direction, units, latest_close,
               initial_stop, chandelier_distance)
     result = place_trailing_order(instrument, units, initial_stop, chandelier_distance, client_id)
+    log.info("[%s] OANDA response: %s", instrument, result)
+    if "orderFillTransaction" not in result:
+        raise RuntimeError("Order did not confirm a fill; reconcile before continuing")
+
+    for ccy in (base, quote):
+        risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + risk_amount
+
+
+def check_and_trade_cross_range_fixed(instrument: str, balance: float, account_ccy: str, risk_by_ccy: dict):
+    """CROSS_RANGE_TOP20 entry check for Portfolio A - the SAME signal as
+    check_and_trade_cross_range() above (shares find_cross_range_signal()),
+    but a fixed 2:1 bracket via place_order() instead of a trailing exit,
+    on CROSS_RANGE_FIXED_PAIRS instead of CROSS_RANGE_PAIRS. No
+    ENABLE_TRAILING_STOPS dependency - place_order() is the same
+    already-proven function golden-cross's own signal uses."""
+    df = get_daily_candles_with_volume(instrument, count=(CROSS_RANGE_PCTL_LOOKBACK + 5) * 6)
+    signal = find_cross_range_signal(df)
+    if signal is None:
+        log.info("[%s] No fresh CROSS_RANGE_TOP20 (fixed) signal. No action.", instrument)
+        return
+    direction, atr_at_signal, signal_time = signal
+
+    position = get_open_position_units(instrument)
+    if position != 0:
+        log.info("[%s] Already in a position (%s units) - CROSS_RANGE_TOP20 (fixed) signal skipped.",
+                  instrument, position)
+        return
+
+    # Same anti-duplicate pattern as check_and_trade_cross_range() - see its
+    # comment for why the position check above isn't sufficient on its own.
+    history = requests.get(f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades",
+        headers=HEADERS, params={"instrument": instrument, "state": "ALL", "count": 500}, timeout=15)
+    history.raise_for_status()
+    if any(pd.Timestamp(t["openTime"]) >= pd.Timestamp(signal_time) for t in history.json()["trades"]):
+        return
+
+    base, quote = currency_legs(instrument)
+    risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
+    cap_dollars = balance * (MAX_CURRENCY_RISK_PCT / 100)
+    base_risk = risk_by_ccy.get(base, 0.0)
+    quote_risk = risk_by_ccy.get(quote, 0.0)
+    if base_risk + risk_amount > cap_dollars or quote_risk + risk_amount > cap_dollars:
+        log.info("[%s] CROSS_RANGE_TOP20 (fixed) %s signal confirmed but blocked by currency exposure cap "
+                  "(%s open risk=%.2f, %s open risk=%.2f, cap=%.2f). No action.",
+                  instrument, direction, base, base_risk, quote, quote_risk, cap_dollars)
+        return
+
+    quote_response = requests.get(f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing",
+        headers=HEADERS, params={"instruments": instrument}, timeout=15)
+    quote_response.raise_for_status()
+    price = quote_response.json()["prices"][0]
+    if not price.get("tradeable", False) or pd.Timestamp.now(tz="UTC") - pd.Timestamp(price["time"]) > pd.Timedelta(minutes=1):
+        raise RuntimeError("Non-tradeable or stale forex quote")
+    latest_close = safety.positive(price["asks" if direction == "LONG" else "bids"][0]["price"])
+
+    stop_distance = atr_at_signal * ATR_STOP_MULT
+    quote_to_account = get_conversion_rate(quote, account_ccy)
+    units = int(risk_amount / (stop_distance * quote_to_account))
+    if direction == "LONG":
+        stop, target = latest_close - stop_distance, latest_close + stop_distance * RR_RATIO
+    else:
+        stop, target = latest_close + stop_distance, latest_close - stop_distance * RR_RATIO
+        units = -units
+
+    client_id = safety.signal_id("xrf", instrument, signal_time)
+    log.info("[%s] CROSS_RANGE_TOP20 (fixed) %s signal - placing order: units=%d close=%.5f "
+              "stop=%.5f target=%.5f", instrument, direction, units, latest_close, stop, target)
+    result = place_order(instrument, units, stop, target, client_id)
     log.info("[%s] OANDA response: %s", instrument, result)
     if "orderFillTransaction" not in result:
         raise RuntimeError("Order did not confirm a fill; reconcile before continuing")
