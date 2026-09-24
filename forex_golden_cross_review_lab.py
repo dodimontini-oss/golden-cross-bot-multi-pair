@@ -154,7 +154,11 @@ class PairData:
 
 
 # ---------------------------------------------------------------- simulator
-def simulate(data, order, cost_mult=0.0, gap_fills=True, curcap=True):
+def simulate(data, order, cost_mult=0.0, gap_fills=True, curcap=True, fin=None):
+    """fin: optional callable fin(pair, direction, ts_seconds) -> ANNUAL financing rate as a decimal on the
+    position's notional (negative = you pay, positive = you earn). Accrued by calendar day held (OANDA's triple
+    Wednesday rollover covers the weekend, so calendar days is the right average) and converted to R via
+    notional/risk = entry/stop_distance. fin=None reproduces the no-swap results exactly."""
     secs = np.unique(np.concatenate([data[p].sec for p in order]))
     idx = {p: {int(s): i for i, s in enumerate(data[p].sec)} for p in order}
     balance = START_EQ
@@ -187,7 +191,8 @@ def simulate(data, order, cost_mult=0.0, gap_fills=True, curcap=True):
             cost_price = (SPREAD_PIPS.get(p, 2.5) + 2 * SLIP_PIPS_PER_SIDE) * pip_size(p) * cost_mult
             open_t[p] = dict(pair=p, dir=direction, entry=entry, stop=entry - direction * stop_dist,
                              target=entry + direction * RR * stop_dist, stop_dist=stop_dist, risk_d=risk_d,
-                             cost_R=cost_price / stop_dist, entry_ts=s)
+                             cost_R=cost_price / stop_dist, entry_ts=s,
+                             fin_rate=(fin(p, direction, s) if fin else 0.0), stop_frac=stop_dist / entry)
             consumed[p] = i
             ccy_risk[base] += risk_d
             ccy_risk[quote] += risk_d
@@ -221,14 +226,17 @@ def simulate(data, order, cost_mult=0.0, gap_fills=True, curcap=True):
             if exit_px is None:
                 continue
             r_gross = tr["dir"] * (exit_px - tr["entry"]) / tr["stop_dist"]
-            pnl = tr["risk_d"] * (r_gross - tr["cost_R"])
+            days_held = (s - tr["entry_ts"]) / 86400.0
+            fin_R = -tr["fin_rate"] * days_held / 365.0 / tr["stop_frac"]      # +ve = cost, -ve = credit
+            pnl = tr["risk_d"] * (r_gross - tr["cost_R"] - fin_R)
             balance += pnl
             base, quote = p.split("_")
             ccy_risk[base] -= tr["risk_d"]
             ccy_risk[quote] -= tr["risk_d"]
             trades.append(dict(pair=p, dir=tr["dir"], entry_ts=tr["entry_ts"], exit_ts=s, entry=tr["entry"],
                                stop_dist=tr["stop_dist"], stop_pct=tr["stop_dist"] / tr["entry"] * 100,
-                               R_gross=r_gross, cost_R=tr["cost_R"], R_net=r_gross - tr["cost_R"],
+                               R_gross=r_gross, cost_R=tr["cost_R"], fin_R=fin_R, days=days_held,
+                               R_net=r_gross - tr["cost_R"] - fin_R,
                                pnl=pnl, risk_d=tr["risk_d"], kind=kind))
             del open_t[p]
 
@@ -239,7 +247,8 @@ def simulate(data, order, cost_mult=0.0, gap_fills=True, curcap=True):
                 last_close[p] = data[p].c[j]
         eq = balance
         for p, tr in open_t.items():
-            eq += tr["risk_d"] * (tr["dir"] * (last_close[p] - tr["entry"]) / tr["stop_dist"] - tr["cost_R"])
+            fin_acc = -tr["fin_rate"] * ((s - tr["entry_ts"]) / 86400.0) / 365.0 / tr["stop_frac"]
+            eq += tr["risk_d"] * (tr["dir"] * (last_close[p] - tr["entry"]) / tr["stop_dist"] - tr["cost_R"] - fin_acc)
         eq_prev = eq
         eq_t.append(s)
         eq_v.append(eq)
